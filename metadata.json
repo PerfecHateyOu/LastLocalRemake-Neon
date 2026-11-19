@@ -1,0 +1,8 @@
+{
+  "name": "Last Local",
+  "description": "A first-person liminal-space horror game set on a late-night New York City G train from Hoyt-Schermerhorn to Court Sq.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
