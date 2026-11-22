@@ -4,7 +4,7 @@
  */
 
 import * as THREE from 'three';
-import { ROUTE_STOPS } from '../game/route';
+import { getLineDefinition, SubwayLineId } from '../game/route';
 
 function makeCanvas(w: number, h: number): [HTMLCanvasElement, CanvasRenderingContext2D] {
   const canvas = document.createElement('canvas');
@@ -134,8 +134,10 @@ export function createBrushedMetalMap(): THREE.CanvasTexture {
 export function createStripMapTexture(
   anisotropy: number,
   anomalous: boolean,
+  lineId: SubwayLineId = 'G',
 ): THREE.CanvasTexture {
   const [c, ctx] = makeCanvas(1024, 160);
+  const line = getLineDefinition(lineId);
 
   // Off-white laminated transit sign backing
   ctx.fillStyle = '#f2f3ef';
@@ -146,11 +148,11 @@ export function createStripMapTexture(
   ctx.fillRect(0, 0, 1024, 24);
   ctx.fillStyle = '#e5e7e4';
   ctx.font = 'bold 13px Arial, sans-serif';
-  ctx.fillText('BROOKLYN — QUEENS CROSSTOWN LOCAL', 18, 16);
+  ctx.fillText(line.subtitle, 18, 16);
   ctx.fillText('CAR B · LOCAL SERVICE', 845, 16);
 
-  // G Line Green Bullet
-  ctx.fillStyle = '#6cbe45';
+  // Line Color Bullet
+  ctx.fillStyle = line.color;
   ctx.beginPath();
   ctx.arc(48, 86, 26, 0, Math.PI * 2);
   ctx.fill();
@@ -158,13 +160,13 @@ export function createStripMapTexture(
   ctx.font = 'bold 34px Arial, sans-serif';
   ctx.textAlign = 'center';
   ctx.textBaseline = 'middle';
-  ctx.fillText('G', 48, 88);
+  ctx.fillText(line.id, 48, 88);
 
-  // Horizontal green route line
+  // Horizontal route line
   const startX = 104;
   const endX = 984;
   const lineY = 76;
-  ctx.strokeStyle = '#6cbe45';
+  ctx.strokeStyle = line.color;
   ctx.lineWidth = 8;
   ctx.beginPath();
   ctx.moveTo(startX, lineY);
@@ -172,7 +174,7 @@ export function createStripMapTexture(
   ctx.stroke();
 
   // Plot all 13 stops in exact order
-  const stops = [...ROUTE_STOPS];
+  const stops = [...line.stops];
   const step = (endX - startX) / (stops.length - 1);
 
   stops.forEach((stop, i) => {
@@ -185,20 +187,25 @@ export function createStripMapTexture(
       x += 18;
     }
 
-    const isCourtSq = stop.index === 12;
-    if (isCourtSq) {
-      // Court Sq dot glows slightly brighter than the rest
-      ctx.fillStyle = 'rgba(134, 239, 172, 0.55)';
+    const isTerminus = stop.index === 12;
+    if (isTerminus) {
+      // Terminus dot glows slightly brighter than the rest
+      ctx.fillStyle =
+        lineId === '7'
+          ? 'rgba(240, 171, 252, 0.55)'
+          : lineId === 'L'
+            ? 'rgba(226, 232, 240, 0.6)'
+            : 'rgba(134, 239, 172, 0.55)';
       ctx.beginPath();
       ctx.arc(x, y, 13, 0, Math.PI * 2);
       ctx.fill();
     }
 
-    ctx.fillStyle = isCourtSq ? '#dcfce7' : '#ffffff';
-    ctx.strokeStyle = isCourtSq ? '#22c55e' : '#141718';
-    ctx.lineWidth = isCourtSq ? 3.5 : 2.5;
+    ctx.fillStyle = isTerminus ? '#f8fafc' : '#ffffff';
+    ctx.strokeStyle = isTerminus ? line.color : '#141718';
+    ctx.lineWidth = isTerminus ? 3.5 : 2.5;
     ctx.beginPath();
-    ctx.arc(x, y, isCourtSq ? 7.5 : 5.5, 0, Math.PI * 2);
+    ctx.arc(x, y, isTerminus ? 7.5 : 5.5, 0, Math.PI * 2);
     ctx.fill();
     ctx.stroke();
 
@@ -206,11 +213,11 @@ export function createStripMapTexture(
     ctx.save();
     ctx.translate(x, lineY + 14);
     ctx.rotate(Math.PI / 5.2);
-    ctx.fillStyle = isCourtSq ? '#0f172a' : '#262b2d';
-    ctx.font = isCourtSq ? 'bold 11px Arial, sans-serif' : '600 10px Arial, sans-serif';
+    ctx.fillStyle = isTerminus ? '#0f172a' : '#262b2d';
+    ctx.font = isTerminus ? 'bold 11px Arial, sans-serif' : '600 10px Arial, sans-serif';
     ctx.textAlign = 'left';
     ctx.textBaseline = 'top';
-    const label = anomalous && i === 5 ? 'MYRTLE-???' : stop.name;
+    const label = anomalous && i === 5 ? `${stop.name.slice(0, 6).toUpperCase()}-???` : stop.name;
     ctx.fillText(label, 0, 0);
     ctx.restore();
   });

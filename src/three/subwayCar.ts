@@ -11,6 +11,7 @@
 
 import * as THREE from 'three';
 import { AnomalyTargetId } from '../game/anomalies';
+import { SubwayLineId } from '../game/route';
 import {
   createBrushedMetalMap,
   createFloorTextures,
@@ -40,6 +41,10 @@ export interface SubwayCarRig {
   stripMapMaterial: THREE.MeshStandardMaterial;
   stripMapNormalTex: THREE.CanvasTexture;
   stripMapAnomalyTex: THREE.CanvasTexture;
+  stripMapTexturesByLine: Record<
+    SubwayLineId,
+    { normal: THREE.CanvasTexture; anomaly: THREE.CanvasTexture }
+  >;
   /** Scrolling tunnel & station platform walls outside windows */
   tunnelWallMat: THREE.MeshStandardMaterial;
   stationWallGroup: THREE.Group;
@@ -68,8 +73,25 @@ export function buildSubwayCar(maxAnisotropy: number): SubwayCarRig {
   const leftPosterTex = createPosterTexture(maxAnisotropy, 'left_normal');
   const rightPosterNormalTex = createPosterTexture(maxAnisotropy, 'right_normal');
   const rightPosterAnomalyTex = createPosterTexture(maxAnisotropy, 'right_anomaly');
-  const stripMapNormalTex = createStripMapTexture(maxAnisotropy, false);
-  const stripMapAnomalyTex = createStripMapTexture(maxAnisotropy, true);
+  const stripMapTexturesByLine: Record<
+    SubwayLineId,
+    { normal: THREE.CanvasTexture; anomaly: THREE.CanvasTexture }
+  > = {
+    G: {
+      normal: createStripMapTexture(maxAnisotropy, false, 'G'),
+      anomaly: createStripMapTexture(maxAnisotropy, true, 'G'),
+    },
+    L: {
+      normal: createStripMapTexture(maxAnisotropy, false, 'L'),
+      anomaly: createStripMapTexture(maxAnisotropy, true, 'L'),
+    },
+    '7': {
+      normal: createStripMapTexture(maxAnisotropy, false, '7'),
+      anomaly: createStripMapTexture(maxAnisotropy, true, '7'),
+    },
+  };
+  const stripMapNormalTex = stripMapTexturesByLine.G.normal;
+  const stripMapAnomalyTex = stripMapTexturesByLine.G.anomaly;
   const ledSign = createLedSignTexture(maxAnisotropy);
   const tunnelTex = createTunnelWallTexture(maxAnisotropy);
   const stationTex = createStationWallTexture(maxAnisotropy);
@@ -81,8 +103,12 @@ export function buildSubwayCar(maxAnisotropy: number): SubwayCarRig {
     leftPosterTex,
     rightPosterNormalTex,
     rightPosterAnomalyTex,
-    stripMapNormalTex,
-    stripMapAnomalyTex,
+    stripMapTexturesByLine.G.normal,
+    stripMapTexturesByLine.G.anomaly,
+    stripMapTexturesByLine.L.normal,
+    stripMapTexturesByLine.L.anomaly,
+    stripMapTexturesByLine['7'].normal,
+    stripMapTexturesByLine['7'].anomaly,
     ledSign.texture,
     tunnelTex,
     stationTex,
@@ -583,6 +609,7 @@ export function buildSubwayCar(maxAnisotropy: number): SubwayCarRig {
     stripMapMaterial,
     stripMapNormalTex,
     stripMapAnomalyTex,
+    stripMapTexturesByLine,
     tunnelWallMat,
     stationWallGroup,
     signalLightMeshes,

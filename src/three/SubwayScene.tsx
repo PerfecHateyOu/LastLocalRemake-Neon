@@ -6,7 +6,7 @@
  * - Zero per-frame GC allocations; raycasts strictly against small interactables array.
  */
 
-import React, { useEffect, useImperativeHandle, useRef } from 'react';
+import React, { useEffect, useImperativeHandle, useRef, useState } from 'react';
 import * as THREE from 'three';
 import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
 import { AnomalyTargetId } from '../game/anomalies';
@@ -40,19 +40,49 @@ const _raycaster = new THREE.Raycaster();
 const _centerNdc = new THREE.Vector2(0, 0);
 const _euler = new THREE.Euler(0, 0, 0, 'YXZ');
 
+let cachedSoftwareWebGL: boolean | null = null;
+
 function detectSoftwareWebGL(): boolean {
+  if (cachedSoftwareWebGL !== null) return cachedSoftwareWebGL;
   try {
     const probeCanvas = document.createElement('canvas');
     const gl = probeCanvas.getContext('webgl2');
-    if (!gl) return true;
+    if (!gl) {
+      cachedSoftwareWebGL = true;
+      return true;
+    }
     const ext = gl.getExtension('WEBGL_debug_renderer_info');
     const param = ext ? ext.UNMASKED_RENDERER_WEBGL : gl.RENDERER;
     const gpu = String(gl.getParameter(param) ?? '');
     gl.getExtension('WEBGL_lose_context')?.loseContext();
-    return /SwiftShader|llvmpipe|softpipe|Software|Basic Render/i.test(gpu);
+    cachedSoftwareWebGL = /SwiftShader|llvmpipe|softpipe|Software|Basic Render/i.test(gpu);
+    return cachedSoftwareWebGL;
   } catch {
+    cachedSoftwareWebGL = true;
     return true;
   }
+}
+
+function disposeObjectTree(root: THREE.Object3D): void {
+  const geometries = new Set<THREE.BufferGeometry>();
+  const materials = new Set<THREE.Material>();
+
+  root.traverse((obj) => {
+    const mesh = obj as THREE.Mesh;
+    if (mesh.geometry) {
+      geometries.add(mesh.geometry);
+    }
+    if (mesh.material) {
+      if (Array.isArray(mesh.material)) {
+        mesh.material.forEach((m) => materials.add(m));
+      } else {
+        materials.add(mesh.material);
+      }
+    }
+  });
+
+  geometries.forEach((g) => g.dispose());
+  materials.forEach((m) => m.dispose());
 }
 
 export const SubwayScene = React.forwardRef<SubwaySceneHandle, SubwaySceneProps>(
@@ -64,6 +94,8 @@ export const SubwayScene = React.forwardRef<SubwaySceneHandle, SubwaySceneProps>
     const rendererRef = useRef<THREE.WebGLRenderer | null>(null);
     const sceneRef = useRef<THREE.Scene | null>(null);
     const cameraRef = useRef<THREE.PerspectiveCamera | null>(null);
+    const [isContextLost, setIsContextLost] = useState(false);
+    const [restoreEpoch, setRestoreEpoch] = useState(0);
 
     const callbacksRef = useRef({ onSimTick, onAimTargetChange, onPointerLockChange });
     callbacksRef.current = { onSimTick, onAimTargetChange, onPointerLockChange };
@@ -74,6 +106,7 @@ export const SubwayScene = React.forwardRef<SubwaySceneHandle, SubwaySceneProps>
         const scene = sceneRef.current;
         const camera = cameraRef.current;
         if (!renderer || !scene || !camera) return null;
+        if (renderer.getContext().isContextLost()) return null;
         try {
           // Render right before toDataURL so the drawing buffer is fresh
           renderer.render(scene, camera);
@@ -114,21 +147,54 @@ export const SubwayScene = React.forwardRef<SubwaySceneHandle, SubwaySceneProps>
       const width = container.clientWidth || window.innerWidth;
       const height = container.clientHeight || window.innerHeight;
 
-      const renderer = new THREE.WebGLRenderer({
-        antialias: !isSoftwareGl,
-        powerPreference: 'high-performance',
-      });
+      let renderer: THREE.WebGLRenderer;
+      try {
+        renderer = new THREE.WebGLRenderer({
+          antialias: !isSoftwareGl,
+          powerPreference: 'default',
+        });
+      } catch {
+        setIsContextLost(true);
+        return;
+      }
+
+      const gl = renderer.getContext();
+      let disposed = false;
+      let contextLost = gl.isContextLost();
+      let hadContextLoss = contextLost;
+      let frameId = 0;
+
       renderer.outputColorSpace = THREE.SRGBColorSpace;
       renderer.toneMapping = THREE.ACESFilmicToneMapping;
       renderer.toneMappingExposure = 0.94;
       renderer.setPixelRatio(isSoftwareGl ? 1 : Math.min(window.devicePixelRatio, 2));
       renderer.setSize(width, height);
-      renderer.shadowMap.enabled = !isSoftwareGl;
-      renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+      // Car B uses unshadowed fluorescent lighting; disabling unused shadow maps avoids extra shader sampler pressure
+      renderer.shadowMap.enabled = false;
       renderer.domElement.style.display = 'block';
       renderer.domElement.style.width = '100%';
       renderer.domElement.style.height = '100%';
       renderer.domElement.dataset.testid = 'subway-canvas';
+
+      // Register context loss/restore listeners immediately before any shader/PMREM work
+      const onContextLost = (e: Event) => {
+        e.preventDefault();
+        contextLost = true;
+        hadContextLoss = true;
+        cancelAnimationFrame(frameId);
+        clearTimeout(frameId);
+        if (!disposed) {
+          setIsContextLost(true);
+        }
+      };
+      const onContextRestored = () => {
+        if (disposed) return;
+        contextLost = false;
+        setIsContextLost(false);
+        setRestoreEpoch((n) => n + 1);
+      };
+      renderer.domElement.addEventListener('webglcontextlost', onContextLost);
+      renderer.domElement.addEventListener('webglcontextrestored', onContextRestored);
 
       container.innerHTML = '';
       container.appendChild(renderer.domElement);
@@ -141,11 +207,16 @@ export const SubwayScene = React.forwardRef<SubwaySceneHandle, SubwaySceneProps>
       sceneRef.current = scene;
 
       // Mandatory procedural RoomEnvironment for realistic brushed stainless steel reflections
-      const pmrem = new THREE.PMREMGenerator(renderer);
-      const envTarget = pmrem.fromScene(new RoomEnvironment(), 0.04);
-      scene.environment = envTarget.texture;
-      scene.environmentIntensity = 0.65;
-      pmrem.dispose();
+      let envTarget: THREE.WebGLRenderTarget | null = null;
+      if (!contextLost && !gl.isContextLost()) {
+        const pmrem = new THREE.PMREMGenerator(renderer);
+        const roomEnv = new RoomEnvironment();
+        envTarget = pmrem.fromScene(roomEnv, 0.04);
+        scene.environment = envTarget.texture;
+        scene.environmentIntensity = 0.65;
+        roomEnv.dispose();
+        pmrem.dispose();
+      }
 
       const camera = new THREE.PerspectiveCamera(BASE_FOV, width / height, 0.08, 45);
       camera.position.set(CAR_BOUNDS.maxX * 0.45, CAR_BOUNDS.baseEyeY, 2.35);
@@ -167,15 +238,17 @@ export const SubwayScene = React.forwardRef<SubwaySceneHandle, SubwaySceneProps>
 
       const allInteractables = [...car.interactables, ...passengers.interactables];
 
-      if (!isSoftwareGl) {
+      if (!isSoftwareGl && !contextLost && !gl.isContextLost()) {
         renderer.compile(scene, camera);
       }
 
-      // Context loss safety
-      const onContextLost = (e: Event) => {
-        e.preventDefault();
-      };
-      renderer.domElement.addEventListener('webglcontextlost', onContextLost);
+      if (gl.isContextLost()) {
+        contextLost = true;
+        hadContextLoss = true;
+        setIsContextLost(true);
+      } else {
+        setIsContextLost(false);
+      }
 
       const handlePointerLockChange = () => {
         const locked = document.pointerLockElement === renderer.domElement;
@@ -184,7 +257,7 @@ export const SubwayScene = React.forwardRef<SubwaySceneHandle, SubwaySceneProps>
       document.addEventListener('pointerlockchange', handlePointerLockChange);
 
       const handleResize = () => {
-        if (!container) return;
+        if (!container || disposed || contextLost || gl.isContextLost()) return;
         const w = container.clientWidth || window.innerWidth;
         const h = container.clientHeight || window.innerHeight;
         camera.aspect = w / h;
@@ -194,8 +267,6 @@ export const SubwayScene = React.forwardRef<SubwaySceneHandle, SubwaySceneProps>
       window.addEventListener('resize', handleResize);
 
       // Animation loop state
-      let disposed = false;
-      let frameId = 0;
       let lastTimeMs = performance.now();
       let lastReportedAim: AnomalyTargetId | null = null;
       let aimThrottleAcc = 0;
@@ -203,24 +274,24 @@ export const SubwayScene = React.forwardRef<SubwaySceneHandle, SubwaySceneProps>
 
       // Software WebGL afterDraw fence sync
       const afterDraw = (cb: () => void) => {
-        if (disposed) return;
-        const gl = renderer.getContext() as WebGL2RenderingContext;
-        if (!gl || typeof gl.fenceSync !== 'function') {
+        if (disposed || contextLost || gl.isContextLost()) return;
+        const gl2 = gl as WebGL2RenderingContext;
+        if (!gl2 || typeof gl2.fenceSync !== 'function') {
           frameId = window.setTimeout(cb, 80);
           return;
         }
-        const sync = gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0);
-        gl.flush();
+        const sync = gl2.fenceSync(gl2.SYNC_GPU_COMMANDS_COMPLETE, 0);
+        gl2.flush();
         const poll = () => {
-          if (disposed) {
-            if (sync) gl.deleteSync(sync);
+          if (disposed || contextLost || gl.isContextLost()) {
+            if (sync && !gl.isContextLost()) gl2.deleteSync(sync);
             return;
           }
-          const status = sync ? gl.getSyncParameter(sync, gl.SYNC_STATUS) : gl.SIGNALED;
-          if (status === gl.UNSIGNALED) {
+          const status = sync ? gl2.getSyncParameter(sync, gl2.SYNC_STATUS) : gl2.SIGNALED;
+          if (status === gl2.UNSIGNALED) {
             frameId = window.setTimeout(poll, 5);
           } else {
-            if (sync) gl.deleteSync(sync);
+            if (sync) gl2.deleteSync(sync);
             frameId = window.setTimeout(cb, 80);
           }
         };
@@ -228,14 +299,20 @@ export const SubwayScene = React.forwardRef<SubwaySceneHandle, SubwaySceneProps>
       };
 
       const tick = () => {
-        if (disposed) return;
+        if (disposed || contextLost) return;
+        if (gl.isContextLost()) {
+          contextLost = true;
+          hadContextLoss = true;
+          setIsContextLost(true);
+          return;
+        }
+
         const nowMs = performance.now();
         const rawDt = Math.max(0, (nowMs - lastTimeMs) / 1000);
         lastTimeMs = nowMs;
         const dt = Math.min(rawDt, 0.05);
 
         const gs = gameStateRef.current;
-        const inp = inputStateRef.current;
 
         // Raycast from screen center against small interactables list (throttled to ~10Hz)
         aimThrottleAcc += dt;
@@ -304,11 +381,11 @@ export const SubwayScene = React.forwardRef<SubwaySceneHandle, SubwaySceneProps>
         // 2. Dynamic LED Strip Sign text
         const ledText =
           state.screen === 'title'
-            ? 'NEXT STOP: HOYT-SCHERMERHORN'
+            ? `NEXT STOP: ${getCurrentLedText(state).replace(/^(THIS IS|NEXT STOP|APPROACHING):\s*/, '')}`
             : getCurrentLedText(state);
         car.ledSign.updateText(ledText);
 
-        // 3. Apply Active Anomalies to 3D Scene
+        // 3. Apply Active Anomalies & Line Selection to 3D Scene
         const hasPosterAnomaly = state.activeAnomalies.some(
           (a) => a.definition.id === 'poster_changed',
         );
@@ -323,7 +400,8 @@ export const SubwayScene = React.forwardRef<SubwaySceneHandle, SubwaySceneProps>
         const hasMapAnomaly = state.activeAnomalies.some(
           (a) => a.definition.id === 'map_stop_moved',
         );
-        const targetMapTex = hasMapAnomaly ? car.stripMapAnomalyTex : car.stripMapNormalTex;
+        const lineMaps = car.stripMapTexturesByLine[state.lineId] ?? car.stripMapTexturesByLine.G;
+        const targetMapTex = hasMapAnomaly ? lineMaps.anomaly : lineMaps.normal;
         if (car.stripMapMaterial.map !== targetMapTex) {
           car.stripMapMaterial.map = targetMapTex;
           car.stripMapMaterial.needsUpdate = true;
@@ -413,7 +491,7 @@ export const SubwayScene = React.forwardRef<SubwaySceneHandle, SubwaySceneProps>
         car.hemiLight.intensity = isBlackout ? 0.06 : 0.84;
         scene.environmentIntensity = isBlackout ? 0.05 : 0.55;
 
-        // 6. Sliding Subway Doors (open during dwelling/arrived)
+        // 6. Sliding Subway Doors (open during dwelling/arrived/trial)
         const doorSlide = state.doorOpen * 0.56;
         for (const pair of car.doorPairs) {
           pair.leftLeaf.position.z = pair.baseZ - 0.34 - doorSlide;
@@ -435,18 +513,28 @@ export const SubwayScene = React.forwardRef<SubwaySceneHandle, SubwaySceneProps>
           }
         });
 
-        // Show station platform wall during dwelling, arrived, and late braking (hidden during blackout)
+        // Show station platform wall during dwelling, arrived, restraint, trial, and late braking
         const showStation =
           state.screen !== 'title' &&
           !isBlackout &&
           (state.phase === 'dwelling' ||
             state.phase === 'arrived' ||
             state.phase === 'restraint' ||
+            state.phase === 'trial' ||
             (state.phase === 'braking' && state.trainSpeed < 0.38));
         car.stationWallGroup.visible = showStation;
         car.signalLightMeshes.forEach((bulb) => {
           bulb.visible = !showStation;
         });
+
+        if (disposed || contextLost || gl.isContextLost()) {
+          if (!contextLost && gl.isContextLost()) {
+            contextLost = true;
+            hadContextLoss = true;
+            setIsContextLost(true);
+          }
+          return;
+        }
 
         renderer.render(scene, camera);
 
@@ -457,8 +545,10 @@ export const SubwayScene = React.forwardRef<SubwaySceneHandle, SubwaySceneProps>
         }
       };
 
-      // Kick off render loop
-      frameId = requestAnimationFrame(tick);
+      // Kick off render loop only if context is valid
+      if (!contextLost && !gl.isContextLost()) {
+        frameId = requestAnimationFrame(tick);
+      }
 
       return () => {
         disposed = true;
@@ -467,19 +557,53 @@ export const SubwayScene = React.forwardRef<SubwaySceneHandle, SubwaySceneProps>
         window.removeEventListener('resize', handleResize);
         document.removeEventListener('pointerlockchange', handlePointerLockChange);
         renderer.domElement.removeEventListener('webglcontextlost', onContextLost);
-        car.dispose();
-        blankPaperTex.dispose();
-        envTarget.dispose();
+        renderer.domElement.removeEventListener('webglcontextrestored', onContextRestored);
+        // Only issue GL delete calls when the context was not lost; after context loss,
+        // the browser already wiped all GPU handles and deleting stale handles emits INVALID_OPERATION.
+        if (!hadContextLoss && !gl.isContextLost()) {
+          car.dispose();
+          blankPaperTex.dispose();
+          envTarget?.dispose();
+          disposeObjectTree(scene);
+        }
         renderer.dispose();
+        if (rendererRef.current === renderer) {
+          rendererRef.current = null;
+        }
       };
-    }, [gameStateRef, inputStateRef]);
+    }, [gameStateRef, inputStateRef, restoreEpoch]);
 
     return (
-      <div
-        ref={mountRef}
-        className="fixed inset-0 w-full h-full bg-[#060708] z-0"
-        aria-label="3D G Train Car B View"
-      />
+      <div className="fixed inset-0 w-full h-full bg-[#060708] z-0">
+        <div
+          ref={mountRef}
+          className="w-full h-full"
+          aria-label="3D G Train Car B View"
+        />
+        {isContextLost && (
+          <div
+            data-testid="webgl-context-lost-fallback"
+            className="absolute inset-0 z-10 flex flex-col items-center justify-center bg-[#090b0c] text-[#e6e9e7] px-6 text-center"
+          >
+            <div className="font-mono text-xs tracking-[0.22em] uppercase text-[#ffb020] mb-2">
+              CAR B VISUAL FEED INTERRUPTED
+            </div>
+            <p className="text-sm text-[#9ca3a0] max-w-sm mb-5">
+              Graphics context was paused by the browser. Waiting for automatic recovery.
+            </p>
+            <button
+              type="button"
+              onClick={() => {
+                setIsContextLost(false);
+                setRestoreEpoch((n) => n + 1);
+              }}
+              className="px-4 py-2 text-xs font-mono uppercase tracking-[0.16em] bg-[#171c1e] hover:bg-[#22292b] border border-[#3a4245] text-[#f0f3f1] cursor-pointer"
+            >
+              Reconnect View
+            </button>
+          </div>
+        )}
+      </div>
     );
   },
 );

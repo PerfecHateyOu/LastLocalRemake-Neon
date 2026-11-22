@@ -1,21 +1,26 @@
 /**
  * Last Local — Main Application Shell
- * Orchestrates the 3D SubwayScene, pure GameState machine, InputController,
- * Web Audio synthesis, and world-matched NYC Transit HUD & Modals.
+ * Orchestrates the 3D SubwayScene, pure GameState machine (G/L/7 lines, 4 Chapters,
+ * 3-Stage False Stop Trial, Radio/PA Frequency Tuner, 13-Case Psych Log, Persistent Archive,
+ * and 8 Priority-Ranked Endings), InputController, Web Audio synthesis, and NYC Transit HUD.
  */
 
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { EvidenceLogModal } from './components/EvidenceLogModal';
+import { ArchiveModal } from './components/ArchiveModal';
 import { EndingReport } from './components/EndingReport';
+import { EvidenceLogModal } from './components/EvidenceLogModal';
+import { FalseStopTrialModal } from './components/FalseStopTrialModal';
 import { HudOverlay } from './components/HudOverlay';
 import { MobileControls } from './components/MobileControls';
 import { PaBoardModal } from './components/PaBoardModal';
 import { PauseModal } from './components/PauseModal';
 import { PolaroidViewfinder } from './components/PolaroidViewfinder';
+import { RadioTunerWidget } from './components/RadioTunerWidget';
 import { TapeRecorderWidget } from './components/TapeRecorderWidget';
 import { TitleScreen } from './components/TitleScreen';
 import { TutorialOverlay } from './components/TutorialOverlay';
 import { AnomalyTargetId } from './game/anomalies';
+import { ArchiveData, clearArchive, loadArchive } from './game/archive';
 import { SubwayAudioEngine } from './game/audio';
 import {
   addMouseLookDelta,
@@ -29,9 +34,13 @@ import {
   setMobileMoveStick,
   stepInput,
 } from './game/input';
+import { ChapterId, SubwayLineId } from './game/route';
 import {
+  ActivePanelId,
   addPolaroidPhoto,
+  adjustTunerFrequency,
   answerMaskPrompt,
+  answerTrialChoice,
   attemptStepOffAtStop,
   chooseSafeHaven,
   createInitialGameState,
@@ -42,11 +51,13 @@ import {
   getCurrentHeartbeat,
   getCurrentLedText,
   getCurrentStop,
-  isNightmareUnlocked,
+  lockTunerSignal,
   RideDifficulty,
+  setTrialHoldState,
   stepGameState,
   submitPlayerFlag,
 } from './game/state';
+import { evaluateTunerSignal } from './game/tuner';
 import { SubwayScene, SubwaySceneHandle } from './three/SubwayScene';
 
 function checkAutostartParam(): boolean {
@@ -61,7 +72,7 @@ function checkAutostartParam(): boolean {
 export default function App() {
   const autostart = checkAutostartParam();
 
-  const initialGame = createInitialGameState('standard', autostart ? 'playing' : 'title');
+  const initialGame = createInitialGameState('standard', autostart ? 'playing' : 'title', 'G', 'full');
   const gameStateRef = useRef<GameState>(initialGame);
   const inputStateRef = useRef<InputState>(createInitialInputState(1.0));
   const audioRef = useRef<SubwayAudioEngine | null>(null);
@@ -69,6 +80,11 @@ export default function App() {
   const hudSyncAccRef = useRef(0);
 
   const [hudState, setHudState] = useState<GameState>(initialGame);
+  const [selectedLine, setSelectedLine] = useState<SubwayLineId>('G');
+  const [selectedChapter, setSelectedChapter] = useState<ChapterId>('full');
+  const [archive, setArchive] = useState<ArchiveData>(() => loadArchive());
+  const [archiveOpen, setArchiveOpen] = useState(false);
+
   const [settings, setSettings] = useState<GameSettings>({
     volume: 0.72,
     muted: false,
@@ -76,7 +92,6 @@ export default function App() {
     reducedGlitch: false,
   });
   const [settingsOpenOnTitle, setSettingsOpenOnTitle] = useState(false);
-  const [nightmareUnlocked, setNightmareUnlocked] = useState<boolean>(() => isNightmareUnlocked());
   const [aimTarget, setAimTarget] = useState<AnomalyTargetId | null>(null);
   const [pointerLocked, setPointerLocked] = useState(false);
   const aimTargetRef = useRef<AnomalyTargetId | null>(null);
@@ -90,7 +105,7 @@ export default function App() {
     gameStateRef.current = next;
     setHudState(next);
     if (next.screen === 'ending') {
-      setNightmareUnlocked(isNightmareUnlocked());
+      setArchive(loadArchive());
     }
   }, []);
 
@@ -103,11 +118,19 @@ export default function App() {
           ? 'title'
           : hudState.screen;
     document.body.dataset.state = mapped;
+    document.body.dataset.line = hudState.lineId;
     document.body.dataset.stop = String(hudState.stopIndex + 1);
     document.body.dataset.phase = hudState.phase;
     document.body.dataset.suspicion = String(hudState.suspicion.value);
     document.body.dataset.sanity = String(hudState.sanity.value);
-  }, [hudState.screen, hudState.stopIndex, hudState.phase, hudState.suspicion.value, hudState.sanity.value]);
+  }, [
+    hudState.screen,
+    hudState.lineId,
+    hudState.stopIndex,
+    hudState.phase,
+    hudState.suspicion.value,
+    hudState.sanity.value,
+  ]);
 
   // Cleanup audio on unmount
   useEffect(() => {
@@ -126,17 +149,47 @@ export default function App() {
     });
   }, []);
 
+  const handleSelectLine = useCallback(
+    (lineId: SubwayLineId) => {
+      setSelectedLine(lineId);
+      if (gameStateRef.current.screen === 'title') {
+        const latestChapter = gameStateRef.current.chapterId;
+        syncHudNow(createInitialGameState('standard', 'title', lineId, latestChapter));
+      }
+    },
+    [syncHudNow],
+  );
+
+  const handleSelectChapter = useCallback(
+    (chapterId: ChapterId) => {
+      setSelectedChapter(chapterId);
+      if (gameStateRef.current.screen === 'title') {
+        const latestLine = gameStateRef.current.lineId;
+        syncHudNow(createInitialGameState('standard', 'title', latestLine, chapterId));
+      }
+    },
+    [syncHudNow],
+  );
+
   const beginRide = useCallback(
-    (difficulty: RideDifficulty, skipTutorial = false) => {
+    (
+      difficulty: RideDifficulty,
+      skipTutorial = false,
+      lineOverride?: SubwayLineId,
+      chapterOverride?: ChapterId,
+    ) => {
+      const lineId = lineOverride ?? selectedLine;
+      const chapterId = difficulty === 'practice' ? 'full' : (chapterOverride ?? selectedChapter);
       audioRef.current?.unlock();
       audioRef.current?.setPaused(false);
       setSettingsOpenOnTitle(false);
+      setArchiveOpen(false);
       inputStateRef.current = createInitialInputState(settings.sensitivity);
       const nextScreen = skipTutorial ? 'playing' : 'tutorial';
-      const fresh = createInitialGameState(difficulty, nextScreen);
+      const fresh = createInitialGameState(difficulty, nextScreen, lineId, chapterId);
       syncHudNow(fresh);
     },
-    [settings.sensitivity, syncHudNow],
+    [selectedLine, selectedChapter, settings.sensitivity, syncHudNow],
   );
 
   const finishTutorialAndPlay = useCallback(() => {
@@ -169,9 +222,9 @@ export default function App() {
   );
 
   const togglePanel = useCallback(
-    (panel: 'pa_board' | 'evidence' | 'polaroid' | 'evp') => {
+    (panel: Exclude<ActivePanelId, 'none'>) => {
       const gs = gameStateRef.current;
-      if (gs.screen !== 'playing') return;
+      if (gs.screen !== 'playing' || gs.phase === 'trial') return;
       const nextPanel = gs.activePanel === panel ? 'none' : panel;
       if (nextPanel !== 'none') {
         sceneRef.current?.exitPointerLock();
@@ -185,7 +238,7 @@ export default function App() {
   const handleFlagTarget = useCallback(
     (targetId: AnomalyTargetId) => {
       const gs = gameStateRef.current;
-      if (gs.screen !== 'playing' || gs.activePanel !== 'none') return;
+      if (gs.screen !== 'playing' || gs.activePanel !== 'none' || gs.phase === 'trial') return;
       const next = submitPlayerFlag(gs, targetId);
       syncHudNow(next);
     },
@@ -224,6 +277,26 @@ export default function App() {
     audioRef.current?.playEvpClip(clip.hasAnomalyResonance);
   }, []);
 
+  const handleTunerFrequencyChange = useCallback(
+    (nextFreq: number) => {
+      const gs = gameStateRef.current;
+      const next = adjustTunerFrequency(gs, nextFreq);
+      const stop = getCurrentStop(next);
+      const { strength } = evaluateTunerSignal(next.tunerFrequencyMhz, next.lineId, stop.number);
+      audioRef.current?.unlock();
+      audioRef.current?.playTunerPulse(strength);
+      syncHudNow(next);
+    },
+    [syncHudNow],
+  );
+
+  const handleLockTunerSignal = useCallback(() => {
+    const gs = gameStateRef.current;
+    audioRef.current?.unlock();
+    audioRef.current?.playTapeClick();
+    syncHudNow(lockTunerSignal(gs));
+  }, [syncHudNow]);
+
   const handleAnswerMask = useCallback(
     (optionId: string) => {
       const next = answerMaskPrompt(gameStateRef.current, optionId);
@@ -242,8 +315,31 @@ export default function App() {
 
   const handleAttemptStepOff = useCallback(() => {
     const next = attemptStepOffAtStop(gameStateRef.current);
+    if (next.phase === 'trial') {
+      sceneRef.current?.exitPointerLock();
+      clearHeldInputs(inputStateRef.current);
+    }
     syncHudNow(next);
   }, [syncHudNow]);
+
+  const handleTrialChoice = useCallback(
+    (choiceId: string) => {
+      const next = answerTrialChoice(gameStateRef.current, choiceId);
+      syncHudNow(next);
+    },
+    [syncHudNow],
+  );
+
+  const handleTrialHold = useCallback(
+    (holding: boolean) => {
+      const gs = gameStateRef.current;
+      if (gs.phase !== 'trial' || !gs.activeTrial || gs.activeTrial.stage !== 2) return;
+      if (gs.activeTrial.holdingStill !== holding) {
+        syncHudNow(setTrialHoldState(gs, holding));
+      }
+    },
+    [syncHudNow],
+  );
 
   const handleRestraintHold = useCallback(
     (holding: boolean) => {
@@ -261,8 +357,8 @@ export default function App() {
     const onKeyDown = (e: KeyboardEvent) => {
       const gs = gameStateRef.current;
 
-      // Title screen: Enter or Space triggers primary start handshake
-      if (gs.screen === 'title' && !settingsOpenOnTitle) {
+      // Title screen: Enter or Space triggers primary start handshake (when no modal open)
+      if (gs.screen === 'title' && !settingsOpenOnTitle && !archiveOpen) {
         if ((e.code === 'Enter' || e.code === 'Space') && !e.repeat) {
           e.preventDefault();
           beginRide('standard', false);
@@ -283,7 +379,6 @@ export default function App() {
       if (pauseToggle) {
         e.preventDefault();
         if (gs.screen === 'playing') {
-          // If an overlay panel is open on Escape, close panel first; P always pauses directly
           if (e.code === 'Escape' && gs.activePanel !== 'none') {
             syncHudNow({ ...gs, activePanel: 'none' });
           } else {
@@ -297,6 +392,25 @@ export default function App() {
 
       if (gs.screen !== 'playing' || e.repeat) return;
 
+      // Active False Stop Trial hotkeys ([1]/[2]/[3] for Stages 1 & 3, [SPACE] for Stage 2)
+      if (gs.phase === 'trial' && gs.activeTrial) {
+        if (gs.activeTrial.stage === 2 && e.code === 'Space') {
+          e.preventDefault();
+          handleTrialHold(true);
+        } else if (
+          gs.activeTrial.stage !== 2 &&
+          (e.code === 'Digit1' || e.code === 'Digit2' || e.code === 'Digit3')
+        ) {
+          const idx = e.code === 'Digit1' ? 0 : e.code === 'Digit2' ? 1 : 2;
+          const choice = gs.activeTrial.choices[idx];
+          if (choice) {
+            e.preventDefault();
+            handleTrialChoice(choice.id);
+          }
+        }
+        return;
+      }
+
       if (e.code === 'KeyB') {
         e.preventDefault();
         togglePanel('pa_board');
@@ -309,6 +423,9 @@ export default function App() {
       } else if (e.code === 'KeyV') {
         e.preventDefault();
         togglePanel('evp');
+      } else if (e.code === 'KeyT') {
+        e.preventDefault();
+        togglePanel('tuner');
       } else if (e.code === 'KeyM') {
         e.preventDefault();
         updateSettings({ muted: !settings.muted });
@@ -337,8 +454,12 @@ export default function App() {
 
     const onKeyUp = (e: KeyboardEvent) => {
       handleKeyUp(inputStateRef.current, e.code);
-      if (e.code === 'Space' && gameStateRef.current.phase === 'restraint') {
-        handleRestraintHold(false);
+      if (e.code === 'Space') {
+        if (gameStateRef.current.phase === 'restraint') {
+          handleRestraintHold(false);
+        } else if (gameStateRef.current.phase === 'trial') {
+          handleTrialHold(false);
+        }
       }
     };
 
@@ -346,7 +467,8 @@ export default function App() {
       if (
         document.pointerLockElement &&
         gameStateRef.current.screen === 'playing' &&
-        gameStateRef.current.activePanel === 'none'
+        gameStateRef.current.activePanel === 'none' &&
+        gameStateRef.current.phase !== 'trial'
       ) {
         addMouseLookDelta(inputStateRef.current, e.movementX, e.movementY);
       }
@@ -355,13 +477,12 @@ export default function App() {
     const onMouseDown = (e: MouseEvent) => {
       if (e.button !== 0) return;
       const gs = gameStateRef.current;
-      if (gs.screen !== 'playing' || gs.activePanel !== 'none') return;
+      if (gs.screen !== 'playing' || gs.activePanel !== 'none' || gs.phase === 'trial') return;
       if (document.pointerLockElement && aimTargetRef.current) {
         handleFlagTarget(aimTargetRef.current);
       }
     };
 
-    // Release stuck keys on window blur / tab switch without auto-opening pause modal
     const onBlur = () => {
       clearHeldInputs(inputStateRef.current);
     };
@@ -387,12 +508,15 @@ export default function App() {
       document.removeEventListener('visibilitychange', onVisChange);
     };
   }, [
+    archiveOpen,
     beginRide,
     finishTutorialAndPlay,
     handleAnswerMask,
     handleCapturePolaroid,
     handleFlagTarget,
     handleRestraintHold,
+    handleTrialChoice,
+    handleTrialHold,
     setPaused,
     settings.muted,
     settingsOpenOnTitle,
@@ -412,10 +536,11 @@ export default function App() {
       const modalBlockingInput =
         gs.activePanel === 'pa_board' ||
         gs.activePanel === 'evidence' ||
-        gs.safeHavenPromptOpen;
+        gs.safeHavenPromptOpen ||
+        (gs.phase === 'trial' && gs.activeTrial?.stage !== 2);
 
       const { movedDuringRestraint } = stepInput(inputStateRef.current, dt, {
-        restraintLocked: gs.phase === 'restraint',
+        restraintLocked: gs.phase === 'restraint' || (gs.phase === 'trial' && gs.activeTrial?.stage === 2),
         modalOpen: modalBlockingInput,
       });
 
@@ -442,7 +567,7 @@ export default function App() {
         heartbeatBpm: hb.bpm,
       });
 
-      // Push React state immediately on discrete phase/screen/prompt changes, otherwise <= 8Hz
+      // Push React state immediately on discrete changes, otherwise <= 8Hz
       hudSyncAccRef.current += dt;
       const discreteChanged =
         next.screen !== gs.screen ||
@@ -452,9 +577,12 @@ export default function App() {
         next.sanity.value !== gs.sanity.value ||
         next.safeHavenPromptOpen !== gs.safeHavenPromptOpen ||
         (next.maskPrompt === null) !== (gs.maskPrompt === null) ||
+        (next.activeTrial?.stage ?? 0) !== (gs.activeTrial?.stage ?? 0) ||
+        (next.activeTrial?.strikes ?? 0) !== (gs.activeTrial?.strikes ?? 0) ||
         (next.subtitle?.text ?? '') !== (gs.subtitle?.text ?? '') ||
         next.paFeed.length !== gs.paFeed.length ||
         next.evpClips.length !== gs.evpClips.length ||
+        next.tunerLogs.length !== gs.tunerLogs.length ||
         next.neutralNotice !== gs.neutralNotice;
 
       if (discreteChanged || hudSyncAccRef.current >= 0.14) {
@@ -462,7 +590,7 @@ export default function App() {
         setHudState(next);
         if (next.screen === 'ending') {
           sceneRef.current?.exitPointerLock();
-          setNightmareUnlocked(isNightmareUnlocked());
+          setArchive(loadArchive());
         }
       }
     },
@@ -491,8 +619,17 @@ export default function App() {
       {/* START SCREEN */}
       {hudState.screen === 'title' && (
         <TitleScreen
-          nightmareUnlocked={nightmareUnlocked}
+          selectedLine={selectedLine}
+          selectedChapter={selectedChapter}
+          nightmareUnlocked={archive.nightmareUnlocked}
+          archive={archive}
+          onSelectLine={handleSelectLine}
+          onSelectChapter={handleSelectChapter}
           onStartRide={(diff) => beginRide(diff, false)}
+          onOpenArchive={() => {
+            setArchive(loadArchive());
+            setArchiveOpen(true);
+          }}
           onOpenSettings={() => setSettingsOpenOnTitle(true)}
         />
       )}
@@ -511,12 +648,25 @@ export default function App() {
         />
       )}
 
+      {/* PERSISTENT ARCHIVE MODAL (from Title or Ending Report) */}
+      {archiveOpen && (
+        <ArchiveModal
+          archive={archive}
+          onResetArchive={() => setArchive(clearArchive())}
+          onClose={() => setArchiveOpen(false)}
+        />
+      )}
+
       {/* SHORT TUTORIAL OVERLAY */}
       {hudState.screen === 'tutorial' && (
         <TutorialOverlay
           difficulty={hudState.difficulty}
+          lineId={hudState.lineId}
+          chapterId={hudState.chapterId}
           onContinue={finishTutorialAndPlay}
-          onBack={() => syncHudNow(createInitialGameState('standard', 'title'))}
+          onBack={() =>
+            syncHudNow(createInitialGameState('standard', 'title', selectedLine, selectedChapter))
+          }
         />
       )}
 
@@ -542,11 +692,21 @@ export default function App() {
             }}
           />
 
+          {/* 3-Stage False Stop Trial Overlay */}
+          {hudState.phase === 'trial' && hudState.activeTrial && (
+            <FalseStopTrialModal
+              trial={hudState.activeTrial}
+              onSelectChoice={handleTrialChoice}
+              onHoldChange={handleTrialHold}
+            />
+          )}
+
           {/* Mobile Virtual Stick & Touch Look */}
           {hudState.activePanel === 'none' &&
             !hudState.maskPrompt &&
             !hudState.safeHavenPromptOpen &&
-            hudState.phase !== 'restraint' && (
+            hudState.phase !== 'restraint' &&
+            hudState.phase !== 'trial' && (
               <MobileControls
                 onMoveStick={(x, y) => setMobileMoveStick(inputStateRef.current, x, y)}
                 onLookDelta={(dx, dy) => addTouchLookDelta(inputStateRef.current, dx, dy)}
@@ -562,6 +722,7 @@ export default function App() {
           {/* [B] PA Board Modal */}
           {hudState.activePanel === 'pa_board' && (
             <PaBoardModal
+              lineId={hudState.lineId}
               currentStopIndex={hudState.stopIndex}
               suspicionValue={hudState.suspicion.value}
               paFeed={hudState.paFeed}
@@ -570,14 +731,33 @@ export default function App() {
             />
           )}
 
-          {/* [TAB] Evidence & Psychological Log Modal */}
+          {/* [TAB] 13-Case Psych Log & Evidence Modal */}
           {hudState.activePanel === 'evidence' && (
             <EvidenceLogModal
+              lineId={hudState.lineId}
+              highestStopReached={hudState.highestStopReached}
+              safeHavenChoice={hudState.safeHavenChoice}
+              restraintOutcome={hudState.restraintOutcome}
+              falseStopIncidentStops={hudState.falseStopIncidentStops}
               flagLog={hudState.flagLog}
               photos={hudState.photos}
               evpClips={hudState.evpClips}
+              tunerLogs={hudState.tunerLogs}
               onPlayEvp={handlePlayEvpClip}
               onClose={() => togglePanel('evidence')}
+            />
+          )}
+
+          {/* [T] Transit-Band Radio / PA Frequency Tuner */}
+          {hudState.activePanel === 'tuner' && (
+            <RadioTunerWidget
+              frequencyMhz={hudState.tunerFrequencyMhz}
+              lineId={hudState.lineId}
+              stopNumber={currentStop.number}
+              logs={hudState.tunerLogs}
+              onChangeFrequency={handleTunerFrequencyChange}
+              onLockSignal={handleLockTunerSignal}
+              onClose={() => togglePanel('tuner')}
             />
           )}
 
@@ -617,24 +797,29 @@ export default function App() {
           stopNumber={currentStop.number}
           onUpdateSettings={updateSettings}
           onResume={() => setPaused(false)}
-          onRestart={() => beginRide(hudState.difficulty, true)}
+          onRestart={() => beginRide(hudState.difficulty, true, hudState.lineId, hudState.chapterId)}
           onQuitToTitle={() => {
             setInputPaused(inputStateRef.current, false);
             audioRef.current?.setPaused(true);
-            syncHudNow(createInitialGameState('standard', 'title'));
+            syncHudNow(createInitialGameState('standard', 'title', selectedLine, selectedChapter));
           }}
         />
       )}
 
-      {/* COURT SQ ENDING REPORT */}
+      {/* TRAVEL REPORT (8 PRIORITY-RANKED ENDINGS) */}
       {hudState.screen === 'ending' && hudState.endingReport && (
         <EndingReport
           report={hudState.endingReport}
-          nightmareUnlocked={nightmareUnlocked}
-          onPlayAgain={(diff) => beginRide(diff, true)}
+          nightmareUnlocked={archive.nightmareUnlocked}
+          discoveredEndingsCount={archive.discoveredEndings.length}
+          onOpenArchive={() => {
+            setArchive(loadArchive());
+            setArchiveOpen(true);
+          }}
+          onPlayAgain={(diff) => beginRide(diff, true, hudState.lineId, hudState.chapterId)}
           onReturnTitle={() => {
             audioRef.current?.setPaused(true);
-            syncHudNow(createInitialGameState('standard', 'title'));
+            syncHudNow(createInitialGameState('standard', 'title', selectedLine, selectedChapter));
           }}
         />
       )}

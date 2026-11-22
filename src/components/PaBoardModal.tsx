@@ -4,11 +4,12 @@
  */
 
 import React from 'react';
-import { ROUTE_STOPS } from '../game/route';
+import { getLineDefinition, SubwayLineId } from '../game/route';
 import { PaFeedEntry } from '../game/state';
 import { SuspicionBar } from './SuspicionBar';
 
 interface PaBoardModalProps {
+  lineId: SubwayLineId;
   currentStopIndex: number;
   suspicionValue: number;
   paFeed: PaFeedEntry[];
@@ -17,12 +18,15 @@ interface PaBoardModalProps {
 }
 
 export const PaBoardModal: React.FC<PaBoardModalProps> = ({
+  lineId,
   currentStopIndex,
   suspicionValue,
   paFeed,
   ledText,
   onClose,
 }) => {
+  const line = getLineDefinition(lineId);
+
   return (
     <div
       className="fixed inset-0 z-30 flex items-center justify-center p-4"
@@ -38,9 +42,9 @@ export const PaBoardModal: React.FC<PaBoardModalProps> = ({
           <div className="flex items-center gap-3">
             <span
               className="inline-flex items-center justify-center w-6 h-6 rounded-full text-xs font-bold text-white shrink-0"
-              style={{ backgroundColor: '#6cbe45' }}
+              style={{ backgroundColor: line.color }}
             >
-              G
+              {line.id}
             </span>
             <h2 id="pa-board-title" className="font-display text-2xl font-bold tracking-wide">
               PA Board &amp; Route Strip
@@ -75,18 +79,20 @@ export const PaBoardModal: React.FC<PaBoardModalProps> = ({
           {/* Exact 13-stop Route Strip */}
           <div>
             <div className="flex items-center justify-between text-xs text-[#9ca5a1] mb-2.5">
-              <span>Hoyt-Schermerhorn to Court Sq</span>
+              <span>
+                {line.stops[0].name} to {line.terminusName}
+              </span>
               <span className="font-mono-tabular">
-                Stop {currentStopIndex + 1} / {ROUTE_STOPS.length}
+                Stop {currentStopIndex + 1} / {line.stops.length}
               </span>
             </div>
 
             <div className="bg-[#0b0d0f] border border-white/10 rounded p-3.5">
               <ol className="space-y-1.5">
-                {ROUTE_STOPS.map((stop) => {
+                {line.stops.map((stop) => {
                   const isCurrent = stop.index === currentStopIndex;
                   const isPassed = stop.index < currentStopIndex;
-                  const isCourtSq = stop.index === 12;
+                  const isTerminus = stop.index === 12;
 
                   return (
                     <li
@@ -107,20 +113,20 @@ export const PaBoardModal: React.FC<PaBoardModalProps> = ({
                         <span
                           className="w-2.5 h-2.5 rounded-full shrink-0"
                           style={{
-                            backgroundColor: isCourtSq
-                              ? '#bbf7d0'
+                            backgroundColor: isTerminus
+                              ? '#f8fafc'
                               : isCurrent
-                                ? '#6cbe45'
+                                ? line.color
                                 : isPassed
-                                  ? '#3f5a38'
+                                  ? '#46504b'
                                   : '#2b3133',
-                            border: isCourtSq
-                              ? '2px solid #4ade80'
+                            border: isTerminus
+                              ? `2px solid ${line.color}`
                               : isCurrent
                                 ? '2px solid #ffffff'
-                                : '1.5px solid #6cbe45',
-                            boxShadow: isCourtSq
-                              ? '0 0 10px 2px rgba(134, 239, 172, 0.75)'
+                                : `1.5px solid ${line.color}`,
+                            boxShadow: isTerminus
+                              ? `0 0 10px 2px ${line.color}`
                               : 'none',
                           }}
                         />
@@ -128,7 +134,7 @@ export const PaBoardModal: React.FC<PaBoardModalProps> = ({
                       </div>
 
                       <span className="font-mono-tabular text-[11px] text-[#98a29e] shrink-0 ml-2">
-                        {isCurrent ? 'CURRENT' : isCourtSq ? 'TERMINUS' : isPassed ? 'PASSED' : ''}
+                        {isCurrent ? 'CURRENT' : isTerminus ? 'TERMINUS' : isPassed ? 'PASSED' : ''}
                       </span>
                     </li>
                   );

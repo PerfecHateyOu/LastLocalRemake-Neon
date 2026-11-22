@@ -98,13 +98,13 @@ export function advanceSanityForStop(
 
 export function applySanityPenalty(state: SanityState, amount: number, stopNumber: number): SanityState {
   const band = getStopSanityBand(stopNumber);
-  const next = Math.max(Math.min(band.min, 0), Math.min(band.max, Math.round(state.value - Math.abs(amount))));
-  // Keep within 0..ceiling
-  const safeVal = Math.max(0, Math.min(band.max, next));
+  // The band floor is a floor for penalties too (e.g. 80 on stops 1–3) —
+  // the same clamp advanceSanityForStop applies to per-stop drift.
+  const next = Math.max(band.min, Math.min(band.max, Math.round(state.value - Math.abs(amount))));
   return {
     ...state,
-    value: safeVal,
-    tier: getSanityTier(safeVal),
+    value: next,
+    tier: getSanityTier(next),
   };
 }
 

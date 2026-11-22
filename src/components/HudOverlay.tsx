@@ -6,7 +6,9 @@
 
 import React from 'react';
 import { AnomalyTargetId, INSPECTABLE_TARGETS } from '../game/anomalies';
+import { getLineDefinition } from '../game/route';
 import {
+  ActivePanelId,
   GameSettings,
   GameState,
   getCurrentHeartbeat,
@@ -21,7 +23,7 @@ interface HudOverlayProps {
   settings: GameSettings;
   aimTarget: AnomalyTargetId | null;
   pointerLocked: boolean;
-  onTogglePanel: (panel: 'pa_board' | 'evidence' | 'polaroid' | 'evp') => void;
+  onTogglePanel: (panel: Exclude<ActivePanelId, 'none'>) => void;
   onPause: () => void;
   onToggleMute: () => void;
   onFlagTarget: (targetId: AnomalyTargetId) => void;
@@ -48,6 +50,7 @@ export const HudOverlay: React.FC<HudOverlayProps> = ({
   onRequestPointerLock,
 }) => {
   const stop = getCurrentStop(state);
+  const line = getLineDefinition(state.lineId);
   const ledText = getCurrentLedText(state);
   const hb = getCurrentHeartbeat(state);
   const isGlitching =
@@ -125,9 +128,9 @@ export const HudOverlay: React.FC<HudOverlayProps> = ({
           >
             <span
               className="inline-flex items-center justify-center w-5 h-5 rounded-full text-[11px] font-bold text-white shrink-0"
-              style={{ backgroundColor: '#6cbe45' }}
+              style={{ backgroundColor: line.color }}
             >
-              G
+              {line.id}
             </span>
             <span className="font-mono-tabular text-xs sm:text-sm font-semibold tracking-wider text-[#fbbf24] truncate">
               {ledText || 'POWER LOST — CAR B'}
@@ -227,6 +230,23 @@ export const HudOverlay: React.FC<HudOverlayProps> = ({
             tabIndex={-1}
             onClick={(e) => {
               e.currentTarget.blur();
+              onTogglePanel('tuner');
+            }}
+            aria-label="Toggle Radio Tuner (T)"
+            className={`hidden sm:inline-flex px-2.5 py-1.5 text-xs font-medium rounded border transition-colors whitespace-nowrap ${
+              state.activePanel === 'tuner'
+                ? 'bg-[#eef0ee] text-[#0b0d0e] border-white'
+                : 'bg-[#0c0e10]/90 text-[#dce2df] border-white/15 hover:bg-[#1a1f22]'
+            }`}
+          >
+            Tuner [T]
+          </button>
+
+          <button
+            type="button"
+            tabIndex={-1}
+            onClick={(e) => {
+              e.currentTarget.blur();
               onTogglePanel('evp');
             }}
             aria-label="Toggle EVP Tape Recorder (V)"
@@ -268,7 +288,10 @@ export const HudOverlay: React.FC<HudOverlayProps> = ({
       </div>
 
       {/* CENTER RETICLE & AIMED TARGET PROMPT */}
-      {state.activePanel === 'none' && !state.maskPrompt && !state.safeHavenPromptOpen && (
+      {state.activePanel === 'none' &&
+        !state.maskPrompt &&
+        !state.safeHavenPromptOpen &&
+        state.phase !== 'trial' && (
         <div className="fixed left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 flex flex-col items-center pointer-events-none">
           <div
             className={`w-2 h-2 rounded-full border transition-transform ${
@@ -301,7 +324,7 @@ export const HudOverlay: React.FC<HudOverlayProps> = ({
           data-testid="safe-haven-prompt"
         >
           <div className="text-xs font-mono-tabular text-[#86efac] uppercase tracking-wider mb-1">
-            Stop 6 · Myrtle-Willoughby Avs
+            Stop {stop.number} · {stop.name}
           </div>
           <h3 className="font-display text-2xl font-bold text-white mb-2">
             Safe Haven Available
@@ -342,7 +365,7 @@ export const HudOverlay: React.FC<HudOverlayProps> = ({
           data-testid="restraint-prompt"
         >
           <div className="text-xs font-mono-tabular text-[#fca5a5] uppercase tracking-wider mb-1">
-            Stop 11 · Greenpoint Av
+            Stop {stop.number} · {stop.name}
           </div>
           <h3 className="font-display text-2xl font-bold text-white mb-1.5">
             Something Is Holding Your Shoulders
@@ -445,7 +468,12 @@ export const HudOverlay: React.FC<HudOverlayProps> = ({
         )}
 
         {/* Quiet desktop pointer-lock cue (only when unlocked and no modal open) */}
-        {!pointerLocked && state.activePanel === 'none' && !state.maskPrompt && !state.safeHavenPromptOpen && state.phase !== 'restraint' && (
+        {!pointerLocked &&
+          state.activePanel === 'none' &&
+          !state.maskPrompt &&
+          !state.safeHavenPromptOpen &&
+          state.phase !== 'restraint' &&
+          state.phase !== 'trial' && (
           <button
             type="button"
             tabIndex={-1}

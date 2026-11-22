@@ -1,8 +1,9 @@
 /**
  * Core Game State Machine — Last Local
- * Coordinates the 13-stop G Train ride, Suspicion, Sanity, Anomalies, Parents,
- * Blackout, Safe Haven, Restraint, Polaroids, EVP Tape Recorder, Practice/Nightmare modes,
- * Achievements, and Court Sq Ending Report.
+ * Coordinates multi-line (G, L, 7) 13-stop rides & 4 Chapters, Suspicion, Sanity,
+ * Anomalies, Parents, Blackout, Safe Haven, Restraint, 3-Stage False Stop Trials,
+ * Radio/PA Frequency Tuner, Polaroids, EVP Tape Recorder, 13-Case Psych Log,
+ * Persistent Archive, Practice/Nightmare modes, and 8 Priority-Ranked Endings.
  */
 
 import {
@@ -14,19 +15,35 @@ import {
   selectAnomaliesForStop,
 } from './anomalies';
 import {
+  loadArchive,
+  recordRunInArchive,
+  saveArchive,
+} from './archive';
+import {
   BACKGROUND_PA_ANNOUNCEMENTS,
   MASK_QUESTIONS,
   MaskQuestion,
   PARENT_EXCHANGES,
   shuffleMaskOptions,
 } from './dialogue';
-import { getLedDisplayText, getStopByIndex, PRACTICE_STOP_INDICES, ROUTE_STOPS, RouteStop } from './route';
+import { EndingId, evaluateEnding } from './endings';
+import {
+  ChapterId,
+  getChapterDefinition,
+  getLedDisplayText,
+  getLineDefinition,
+  getStopByIndex,
+  PRACTICE_STOP_INDICES,
+  RouteStop,
+  SubwayLineId,
+} from './route';
 import {
   advanceSanityForStop,
   applySanityPenalty,
   createInitialSanity,
   getHeartbeatProfile,
   SanityState,
+  SanityTier,
   tickSanityEffects,
   triggerSanityGlitch,
 } from './sanity';
@@ -38,6 +55,18 @@ import {
   SuspicionBand,
   SuspicionState,
 } from './suspicion';
+import {
+  createTrialState,
+  setTrialHolding,
+  stepTrialState,
+  submitTrialChoice,
+  TrialState,
+} from './trial';
+import {
+  clampFrequency,
+  evaluateTunerSignal,
+  TunerSignalLog,
+} from './tuner';
 
 export type ScreenMode = 'title' | 'tutorial' | 'playing' | 'paused' | 'ending';
 export type RideDifficulty = 'standard' | 'practice' | 'nightmare';
@@ -47,7 +76,10 @@ export type RidePhase =
   | 'dwelling'
   | 'blackout'
   | 'restraint'
+  | 'trial'
   | 'arrived';
+
+export type ActivePanelId = 'none' | 'pa_board' | 'evidence' | 'polaroid' | 'evp' | 'tuner';
 
 export interface PaFeedEntry {
   id: string;
@@ -95,30 +127,35 @@ export interface GameSettings {
 }
 
 export interface EndingReportData {
-  /**
-   * TBD: Exact ending variants and scoring thresholds are marked TBD in the brief.
-   * Placeholder variants evaluate suspicion, sanity, flags, haven, and restraint choices.
-   */
-  endingId: string;
+  endingId: EndingId;
+  priority: number;
+  code: string;
+  tone: 'dark' | 'uneasy' | 'clean' | 'true';
   title: string;
   subtitle: string;
   summary: string;
+  lineId: SubwayLineId;
+  chapterId: ChapterId;
   difficulty: RideDifficulty;
   finalSuspicion: number;
   finalSuspicionBand: SuspicionBand;
   peakSuspicion: number;
   finalSanity: number;
-  finalSanityTier: string;
+  finalSanityTier: SanityTier;
   stopsCompleted: number;
   totalStops: number;
+  highestStopReached: number;
   trueFlags: number;
   falsePositives: number;
   totalFlags: number;
   safeHavenChoice: 'taken' | 'refused' | 'not_reached';
   restraintOutcome: 'held_still' | 'let_go' | 'not_reached';
   falseStopDisembarks: number;
+  falseStopTrialsSurvived: number;
+  falseStopTrialCollapsed: boolean;
   photosTaken: number;
   evpClipsRecorded: number;
+  tunerSignalsLocked: number;
   durationSec: number;
   unlockedAchievements: string[];
   nightmareJustUnlocked: boolean;
@@ -126,11 +163,15 @@ export interface EndingReportData {
 
 export interface GameState {
   screen: ScreenMode;
+  lineId: SubwayLineId;
+  chapterId: ChapterId;
   difficulty: RideDifficulty;
   /** Index into active stop sequence */
   sequencePos: number;
   /** Canonical stop index (0..12) */
   stopIndex: number;
+  /** Highest 1-based stop reached during this ride (for 13-Case Psych Log) */
+  highestStopReached: number;
   phase: RidePhase;
   phaseTimer: number;
   phaseDuration: number;
@@ -148,6 +189,8 @@ export interface GameState {
   paFeed: PaFeedEntry[];
   photos: PolaroidPhoto[];
   evpClips: EvpRecording[];
+  tunerFrequencyMhz: number;
+  tunerLogs: TunerSignalLog[];
 
   /** Active dialogue & prompts */
   subtitle: ActiveSubtitle | null;
@@ -177,11 +220,15 @@ export interface GameState {
   restraintProgress: number; // 0..1
   restraintSlips: number;
   falseStopDisembarks: number;
+  falseStopTrialsSurvived: number;
+  falseStopTrialCollapsed: boolean;
+  falseStopIncidentStops: number[];
+  activeTrial: TrialState | null;
   hadMistakeThisStop: boolean;
   stopAnnouncementPlayed: boolean;
 
   /** Active tool overlays */
-  activePanel: 'none' | 'pa_board' | 'evidence' | 'polaroid' | 'evp';
+  activePanel: ActivePanelId;
   evpRecordingActive: boolean;
   evpRecordElapsed: number;
 
@@ -193,69 +240,64 @@ export interface GameState {
   endingReport: EndingReportData | null;
 }
 
-const STORAGE_KEY_NIGHTMARE = 'last_local_nightmare_unlocked_v1';
-const STORAGE_KEY_ACHIEVEMENTS = 'last_local_achievements_v1';
-
 export function isNightmareUnlocked(): boolean {
-  try {
-    return typeof window !== 'undefined' && window.localStorage.getItem(STORAGE_KEY_NIGHTMARE) === '1';
-  } catch {
-    return false;
-  }
+  return loadArchive().nightmareUnlocked;
 }
 
 export function saveNightmareUnlocked(): void {
-  try {
-    if (typeof window !== 'undefined') {
-      window.localStorage.setItem(STORAGE_KEY_NIGHTMARE, '1');
-    }
-  } catch {
-    // Ignore storage failures
+  const archive = loadArchive();
+  if (!archive.nightmareUnlocked) {
+    saveArchive({ ...archive, nightmareUnlocked: true });
   }
 }
 
 export function loadSavedAchievements(): string[] {
-  try {
-    if (typeof window === 'undefined') return [];
-    const raw = window.localStorage.getItem(STORAGE_KEY_ACHIEVEMENTS);
-    return raw ? (JSON.parse(raw) as string[]) : [];
-  } catch {
-    return [];
-  }
+  return loadArchive().achievements;
 }
 
 export function saveAchievements(list: string[]): void {
-  try {
-    if (typeof window !== 'undefined') {
-      const merged = Array.from(new Set([...loadSavedAchievements(), ...list]));
-      window.localStorage.setItem(STORAGE_KEY_ACHIEVEMENTS, JSON.stringify(merged));
-    }
-  } catch {
-    // Ignore storage failures
-  }
+  const archive = loadArchive();
+  const merged = Array.from(new Set([...archive.achievements, ...list]));
+  saveArchive({ ...archive, achievements: merged });
 }
 
-export function getSequenceForDifficulty(difficulty: RideDifficulty): readonly number[] {
+export function getSequenceForDifficulty(
+  difficulty: RideDifficulty,
+  chapterId: ChapterId = 'full',
+): readonly number[] {
   if (difficulty === 'practice') {
     return PRACTICE_STOP_INDICES;
   }
-  return ROUTE_STOPS.map((s) => s.index);
+  return getChapterDefinition(chapterId).stopIndices;
 }
 
 export function getCurrentStop(state: GameState): RouteStop {
-  return getStopByIndex(state.stopIndex);
+  return getStopByIndex(state.stopIndex, state.lineId);
 }
 
 export function createInitialGameState(
   difficulty: RideDifficulty = 'standard',
   screen: ScreenMode = 'title',
+  lineId: SubwayLineId = 'G',
+  chapterId: ChapterId = 'full',
 ): GameState {
-  const firstStop = getStopByIndex(0);
+  const line = getLineDefinition(lineId);
+  const seq = getSequenceForDifficulty(difficulty, chapterId);
+  const startStopIndex = seq[0] ?? 0;
+  const firstStop = getStopByIndex(startStopIndex, lineId);
+  const initialSanity =
+    startStopIndex > 0
+      ? advanceSanityForStop(createInitialSanity(), firstStop.number, difficulty === 'nightmare', difficulty === 'practice')
+      : createInitialSanity();
+
   return {
     screen,
+    lineId,
+    chapterId: difficulty === 'practice' ? 'full' : chapterId,
     difficulty,
     sequencePos: 0,
-    stopIndex: 0,
+    stopIndex: startStopIndex,
+    highestStopReached: firstStop.number,
     phase: 'dwelling',
     phaseTimer: firstStop.dwellSeconds,
     phaseDuration: firstStop.dwellSeconds,
@@ -264,23 +306,31 @@ export function createInitialGameState(
     elapsedSec: 0,
 
     suspicion: createInitialSuspicion(),
-    sanity: createInitialSanity(),
+    sanity: initialSanity,
     activeAnomalies: [],
     flagLog: [],
     paFeed: [
       {
         id: 'pa-boarding',
-        stopNumber: 1,
-        text: 'This is a Court Square-bound G local train. Next stop: Fulton St.',
+        stopNumber: firstStop.number,
+        text:
+          startStopIndex === 0
+            ? line.boardingPa
+            : `This is ${firstStop.name}. ${line.id} local service toward ${line.terminusName}.`,
         timestampSec: 0,
       },
     ],
     photos: [],
     evpClips: [],
+    tunerFrequencyMhz: 92.5,
+    tunerLogs: [],
 
     subtitle: {
       speaker: 'Mom',
-      text: 'Sit still, sweetheart. Thirteen stops and we’re home.',
+      text:
+        startStopIndex === 0
+          ? `Sit still, sweetheart. Thirteen stops to ${line.terminusName} and we’re home.`
+          : `Stay seated through ${firstStop.name}. Keep your eyes ahead.`,
       remainingSec: 4.5,
     },
     pendingSubtitleQueue: [],
@@ -306,6 +356,10 @@ export function createInitialGameState(
     restraintProgress: 0,
     restraintSlips: 0,
     falseStopDisembarks: 0,
+    falseStopTrialsSurvived: 0,
+    falseStopTrialCollapsed: false,
+    falseStopIncidentStops: [],
+    activeTrial: null,
     hadMistakeThisStop: false,
     stopAnnouncementPlayed: true,
 
@@ -324,6 +378,58 @@ export interface StepCallbacks {
   onDoorChime?: () => void;
   onDoorSlide?: (opening: boolean) => void;
   onPaDing?: () => void;
+}
+
+function resolveTrialOutcome(
+  state: GameState,
+  updatedTrial: TrialState,
+  stop: RouteStop,
+): GameState {
+  const practice = state.difficulty === 'practice';
+
+  if (updatedTrial.status === 'collapsed') {
+    const failedState: GameState = {
+      ...state,
+      activeTrial: null,
+      falseStopTrialCollapsed: true,
+      suspicion: applySuspicionChange(state.suspicion, 'false_stop_exit', stop.number, practice),
+      sanity: triggerSanityGlitch(applySanityPenalty(state.sanity, 12, stop.number), 0.9, 1.0),
+    };
+    return finalizeRide(failedState);
+  }
+
+  if (updatedTrial.status === 'survived') {
+    const strikePenalty = updatedTrial.strikes * 6;
+    const nextSanity =
+      strikePenalty > 0 ? applySanityPenalty(state.sanity, strikePenalty, stop.number) : state.sanity;
+    return {
+      ...state,
+      phase: 'dwelling',
+      phaseDuration: 2.2,
+      phaseTimer: 2.2,
+      doorOpen: 0.75,
+      activeTrial: null,
+      falseStopTrialsSurvived: state.falseStopTrialsSurvived + 1,
+      sanity: nextSanity,
+      parentWatching: 'dad',
+      parentWatchTimer: 5.0,
+      subtitle: {
+        speaker: 'Dad',
+        text: stop.isForgivingFalseStop
+          ? 'Back in your seat. That platform sign wasn’t right.'
+          : 'Sit down and don’t move. That was not our last stop.',
+        remainingSec: 4.0,
+      },
+      neutralNotice:
+        updatedTrial.lastFeedback ?? 'You made it back inside Car B before the doors sealed.',
+      neutralNoticeTimer: 3.6,
+    };
+  }
+
+  return {
+    ...state,
+    activeTrial: updatedTrial,
+  };
 }
 
 /**
@@ -349,6 +455,7 @@ export function stepGameState(
   const nightmare = state.difficulty === 'nightmare';
   const practice = state.difficulty === 'practice';
   const stop = getCurrentStop(state);
+  const line = getLineDefinition(state.lineId);
 
   const next: GameState = {
     ...state,
@@ -362,6 +469,24 @@ export function stepGameState(
     if (next.neutralNoticeTimer === 0) {
       next.neutralNotice = null;
     }
+  }
+
+  // Active 3-Stage False Stop Trial takes priority over normal dwell progression
+  if (next.phase === 'trial' && next.activeTrial) {
+    next.trainSpeed = 0;
+    const prevStrikes = next.activeTrial.strikes;
+    const updatedTrial = stepTrialState(next.activeTrial, clampedDt, stop, options.restraintMoved);
+    if (updatedTrial.strikes > prevStrikes) {
+      next.hadMistakeThisStop = true;
+      next.suspicion = applySuspicionChange(
+        next.suspicion,
+        stop.isForgivingFalseStop ? 'forgiving_false_stop' : 'visible_reaction',
+        stop.number,
+        practice,
+      );
+      next.sanity = triggerSanityGlitch(applySanityPenalty(next.sanity, 4, stop.number), 0.55, 0.85);
+    }
+    return resolveTrialOutcome(next, updatedTrial, stop);
   }
 
   // Active EVP recording timer
@@ -396,7 +521,6 @@ export function stepGameState(
   if (next.maskPrompt) {
     const rem = next.maskPrompt.remainingSec - clampedDt;
     if (rem <= 0) {
-      // Prompt timed out: +8 suspicion
       next.maskPrompt = null;
       next.hadMistakeThisStop = true;
       next.suspicion = applySuspicionChange(next.suspicion, 'prompt_timeout', stop.number, practice);
@@ -429,7 +553,6 @@ export function stepGameState(
       }
     }
 
-    // Check if player stares too long at an active anomaly or snaps head too fast while watched
     const isStaringAtActiveAnomaly =
       options.lookingAtAnomalyTarget !== null &&
       next.activeAnomalies.some((a) => a.definition.targetId === options.lookingAtAnomalyTarget);
@@ -451,7 +574,6 @@ export function stepGameState(
       next.parentWatching = 'dad';
       next.parentWatchTimer = Math.max(next.parentWatchTimer, watchProfile.holdLookSec);
 
-      // Stop 4 Classon Av is forgiving
       const reason = stop.isForgivingFalseStop ? 'forgiving_false_stop' : 'visible_reaction';
       next.suspicion = applySuspicionChange(next.suspicion, reason, stop.number, practice);
       next.subtitle = {
@@ -462,12 +584,12 @@ export function stepGameState(
     }
   }
 
-  // Single fluorescent tube flicker mid-ride (never on braking/approach, never whole car at once)
+  // Single fluorescent tube flicker mid-ride
   if (next.phase === 'blackout') {
-    next.flickeringTubeIndex = 2; // Single dim tube flickering during blackout
+    next.flickeringTubeIndex = 2;
     next.flickerTimer = 1;
   } else if (stop.kind === 'forced_bait' && (next.phase === 'cruising' || next.phase === 'dwelling')) {
-    next.flickeringTubeIndex = 4; // Bait flickering light at Stop 12 (21 St)
+    next.flickeringTubeIndex = 4;
     next.flickerTimer = 1;
   } else if (next.phase === 'cruising') {
     if (next.flickerTimer > 0) {
@@ -484,7 +606,6 @@ export function stepGameState(
       }
     }
   } else {
-    // Never flicker on station approach (braking) or normal dwell
     next.flickeringTubeIndex = -1;
     next.flickerTimer = 0;
   }
@@ -526,13 +647,13 @@ export function stepGameState(
 
     next.paCooldown -= clampedDt;
     if (next.paCooldown <= 0) {
-      const line =
+      const lineText =
         BACKGROUND_PA_ANNOUNCEMENTS[Math.floor(rng() * BACKGROUND_PA_ANNOUNCEMENTS.length)];
       next.paFeed = [
         {
           id: `pa-${Math.round(next.elapsedSec * 100)}`,
           stopNumber: stop.number,
-          text: line,
+          text: lineText,
           timestampSec: next.elapsedSec,
         },
         ...next.paFeed.slice(0, 19),
@@ -542,7 +663,7 @@ export function stepGameState(
     }
   }
 
-  // Restraint mechanics at Stop 11 (Greenpoint Av)
+  // Restraint mechanics at Stop 11 (Greenpoint Av / Morgan Av / 46 St-Bliss St)
   if (next.phase === 'restraint') {
     if (next.restraintHolding && !options.restraintMoved) {
       next.restraintProgress = Math.min(1, next.restraintProgress + clampedDt / 6.5);
@@ -601,7 +722,6 @@ export function stepGameState(
     next.trainSpeed = Math.min(speedCap * 0.88, next.trainSpeed + clampedDt * 0.35);
     next.doorOpen = 0;
     if (next.phaseTimer <= 0) {
-      // Resume ride into Stop 7 (Flushing Av)
       return beginSegmentToNextStop(next, options.callbacks, rng);
     }
   } else if (next.phase === 'braking') {
@@ -609,11 +729,9 @@ export function stepGameState(
     next.trainSpeed = Math.max(0, speedCap * (1 - progress));
     if (!next.stopAnnouncementPlayed && progress > 0.35) {
       next.stopAnnouncementPlayed = true;
+      // Signature Lying PA preserved on Stop 9 (Metropolitan Av / Grand St / 33 St-Rawson St)
       const announceText =
-        stop.lyingPaLine ??
-        (stop.kind === 'final'
-          ? 'This is Court Square. Last stop. Thank you for riding the G train.'
-          : `This is ${stop.name}.`);
+        stop.lyingPaLine ?? (stop.kind === 'final' ? line.finalPa : `This is ${stop.name}.`);
       next.paFeed = [
         {
           id: `pa-stop-${stop.number}-${Math.round(next.elapsedSec)}`,
@@ -629,8 +747,7 @@ export function stepGameState(
     if (next.phaseTimer <= 0) {
       next.trainSpeed = 0;
 
-      // Stop 13 (Court Sq) or end of Practice Mode finishes the ride
-      const seq = getSequenceForDifficulty(next.difficulty);
+      const seq = getSequenceForDifficulty(next.difficulty, next.chapterId);
       if (next.sequencePos >= seq.length - 1) {
         next.phase = 'arrived';
         next.doorOpen = 1;
@@ -638,7 +755,6 @@ export function stepGameState(
         return finalizeRide(next);
       }
 
-      // Stop 11 (Greenpoint Av) triggers the Restraint before doors open
       if (stop.kind === 'restraint' && next.restraintOutcome === 'not_reached') {
         next.phase = 'restraint';
         next.phaseDuration = 9.0;
@@ -660,7 +776,6 @@ export function stepGameState(
     next.doorOpen = Math.min(1, next.doorOpen + clampedDt * 2.4);
 
     if (next.phaseTimer <= 0) {
-      // If player ignored Safe Haven at Stop 6, treat as refusing
       if (stop.kind === 'safe_haven' && next.safeHavenChoice === 'not_reached') {
         next.safeHavenChoice = 'refused';
         next.safeHavenPromptOpen = false;
@@ -673,7 +788,6 @@ export function stepGameState(
         );
       }
 
-      // Clean stop reward (-5 suspicion) if no mistakes occurred at this stop
       if (next.stopIndex >= 1 && !next.hadMistakeThisStop) {
         next.suspicion = applySuspicionChange(next.suspicion, 'clean_stop', stop.number, practice);
       }
@@ -681,7 +795,6 @@ export function stepGameState(
       options.callbacks?.onDoorChime?.();
       options.callbacks?.onDoorSlide?.(false);
 
-      // After Stop 6 (Myrtle-Willoughby Avs): enter the Blackout segment!
       if (stop.blackoutAfter && !practice) {
         next.phase = 'blackout';
         next.phaseDuration = nightmare ? 11 : 13;
@@ -707,10 +820,10 @@ export function beginSegmentToNextStop(
   _callbacks?: StepCallbacks,
   rng: () => number = Math.random,
 ): GameState {
-  const seq = getSequenceForDifficulty(state.difficulty);
+  const seq = getSequenceForDifficulty(state.difficulty, state.chapterId);
   const nextSeqPos = Math.min(seq.length - 1, state.sequencePos + 1);
   const nextStopIndex = seq[nextSeqPos];
-  const nextStop = getStopByIndex(nextStopIndex);
+  const nextStop = getStopByIndex(nextStopIndex, state.lineId);
   const nightmare = state.difficulty === 'nightmare';
   const practice = state.difficulty === 'practice';
 
@@ -720,7 +833,6 @@ export function beginSegmentToNextStop(
   const anomalies = selectAnomaliesForStop(nextStop.number, state.elapsedSec, practice, rng);
   let nextSanity = advanceSanityForStop(state.sanity, nextStop.number, nightmare, practice);
 
-  // Critical anomalies trigger a glitch the moment they appear
   if (anomalies.some((a) => a.definition.isCritical)) {
     nextSanity = triggerSanityGlitch(nextSanity, 0.5, 0.82);
   }
@@ -729,6 +841,7 @@ export function beginSegmentToNextStop(
     ...state,
     sequencePos: nextSeqPos,
     stopIndex: nextStopIndex,
+    highestStopReached: Math.max(state.highestStopReached, nextStop.number),
     phase: 'cruising',
     phaseDuration: cruiseDur,
     phaseTimer: cruiseDur,
@@ -755,7 +868,6 @@ export function submitPlayerFlag(state: GameState, targetId: AnomalyTargetId): G
   let hadMistake = state.hadMistakeThisStop;
 
   if (!matched) {
-    // False positive: +20 suspicion (unless forgiving stop)
     hadMistake = true;
     nextSuspicion = applySuspicionChange(
       nextSuspicion,
@@ -792,6 +904,7 @@ export function submitPlayerFlag(state: GameState, targetId: AnomalyTargetId): G
 export function answerMaskPrompt(state: GameState, optionId: string): GameState {
   if (!state.maskPrompt) return state;
   const stop = getCurrentStop(state);
+  const line = getLineDefinition(state.lineId);
   const practice = state.difficulty === 'practice';
   const chosen = state.maskPrompt.question.options.find((o) => o.id === optionId);
   if (!chosen) return state;
@@ -803,7 +916,7 @@ export function answerMaskPrompt(state: GameState, optionId: string): GameState 
   if (chosen.isCalm) {
     reply = {
       speaker: state.maskPrompt.question.speaker,
-      text: 'Good. Just sit tight until Court Square.',
+      text: `Good. Just sit tight until ${line.terminusName}.`,
       remainingSec: 3.0,
     };
   } else {
@@ -832,14 +945,13 @@ export function answerMaskPrompt(state: GameState, optionId: string): GameState 
   };
 }
 
-/** Safe Haven choice at Stop 6 (Myrtle-Willoughby Avs) */
+/** Safe Haven choice at Stop 6 (Myrtle-Willoughby / Bedford Av / Hunters Point Av) */
 export function chooseSafeHaven(state: GameState, takeShelter: boolean): GameState {
   const stop = getCurrentStop(state);
   if (stop.kind !== 'safe_haven') return state;
   const practice = state.difficulty === 'practice';
 
   if (takeShelter) {
-    // Shelter steadies nerves slightly without breaking per-stop ceiling
     const nextSanity = {
       ...state.sanity,
       value: Math.min(95, state.sanity.value + 6),
@@ -849,7 +961,7 @@ export function chooseSafeHaven(state: GameState, takeShelter: boolean): GameSta
       safeHavenChoice: 'taken',
       safeHavenPromptOpen: false,
       sanity: nextSanity,
-      neutralNotice: 'You ducked beneath the Myrtle-Willoughby shelter awning until the doors chimed.',
+      neutralNotice: `You ducked beneath the ${stop.name} shelter awning until the doors chimed.`,
       neutralNoticeTimer: 3.8,
     };
   }
@@ -865,29 +977,41 @@ export function chooseSafeHaven(state: GameState, takeShelter: boolean): GameSta
   };
 }
 
-/** Attempt to step off through open doors during dwell */
+/** Attempt to step off through open doors during dwell — triggers 3-stage False Stop Trial on false stops */
 export function attemptStepOffAtStop(state: GameState): GameState {
   if (state.phase !== 'dwelling') return state;
   const stop = getCurrentStop(state);
+  const line = getLineDefinition(state.lineId);
   const practice = state.difficulty === 'practice';
 
   if (stop.isFalseStop) {
     const reason = stop.isForgivingFalseStop ? 'forgiving_false_stop' : 'false_stop_exit';
+    const trial = createTrialState(stop, state.lineId);
+    const incidentStops = state.falseStopIncidentStops.includes(stop.number)
+      ? state.falseStopIncidentStops
+      : [...state.falseStopIncidentStops, stop.number];
+
     return {
       ...state,
+      phase: 'trial',
+      activePanel: 'none',
+      maskPrompt: null,
+      safeHavenPromptOpen: false,
       hadMistakeThisStop: true,
       falseStopDisembarks: state.falseStopDisembarks + 1,
+      falseStopIncidentStops: incidentStops,
+      activeTrial: trial,
       suspicion: applySuspicionChange(state.suspicion, reason, stop.number, practice),
       sanity: triggerSanityGlitch(applySanityPenalty(state.sanity, 6, stop.number), 0.65, 0.9),
       subtitle: {
         speaker: 'Dad',
         text: stop.isForgivingFalseStop
           ? 'Get back inside. That sign isn’t right.'
-          : 'Sit down. This is not Court Square.',
+          : `Sit down. This is not ${line.terminusName}.`,
         remainingSec: 3.8,
       },
-      neutralNotice: 'The platform outside was blank concrete. You stepped back inside before the doors closed.',
-      neutralNoticeTimer: 3.8,
+      neutralNotice: null,
+      neutralNoticeTimer: 0,
     };
   }
 
@@ -897,8 +1021,94 @@ export function attemptStepOffAtStop(state: GameState): GameState {
 
   return {
     ...state,
-    neutralNotice: 'Not our stop yet. Stay seated until Court Sq.',
+    neutralNotice: `Not our stop yet. Stay seated until ${line.terminusName}.`,
     neutralNoticeTimer: 2.6,
+  };
+}
+
+/** Submit a Stage 1 or Stage 3 choice during an active False Stop Trial */
+export function answerTrialChoice(state: GameState, choiceId: string): GameState {
+  if (state.phase !== 'trial' || !state.activeTrial) return state;
+  const stop = getCurrentStop(state);
+  const practice = state.difficulty === 'practice';
+  const prevStrikes = state.activeTrial.strikes;
+  const updatedTrial = submitTrialChoice(state.activeTrial, choiceId, stop);
+
+  let next = state;
+  if (updatedTrial.strikes > prevStrikes) {
+    next = {
+      ...next,
+      hadMistakeThisStop: true,
+      suspicion: applySuspicionChange(
+        next.suspicion,
+        stop.isForgivingFalseStop ? 'forgiving_false_stop' : 'visible_reaction',
+        stop.number,
+        practice,
+      ),
+      sanity: triggerSanityGlitch(applySanityPenalty(next.sanity, 5, stop.number), 0.6, 0.85),
+    };
+  }
+
+  return resolveTrialOutcome(next, updatedTrial, stop);
+}
+
+/** Toggle hold-still state during Stage 2 of an active False Stop Trial */
+export function setTrialHoldState(state: GameState, holding: boolean): GameState {
+  if (state.phase !== 'trial' || !state.activeTrial) return state;
+  return {
+    ...state,
+    activeTrial: setTrialHolding(state.activeTrial, holding),
+  };
+}
+
+/** Adjust the transit-band Radio/PA Frequency Tuner */
+export function adjustTunerFrequency(state: GameState, nextFreqMhz: number): GameState {
+  return {
+    ...state,
+    tunerFrequencyMhz: clampFrequency(nextFreqMhz),
+  };
+}
+
+/** Attempt to lock and record the currently tuned frequency signal */
+export function lockTunerSignal(state: GameState): GameState {
+  if (state.screen !== 'playing') return state;
+  const stop = getCurrentStop(state);
+  const { lockedChannel } = evaluateTunerSignal(state.tunerFrequencyMhz, state.lineId, stop.number);
+
+  if (!lockedChannel) {
+    return {
+      ...state,
+      neutralNotice: `Static at ${state.tunerFrequencyMhz.toFixed(1)} MHz — no clean carrier locked.`,
+      neutralNoticeTimer: 2.2,
+    };
+  }
+
+  const alreadyLogged = state.tunerLogs.some((l) => l.channelId === lockedChannel.id);
+  if (alreadyLogged) {
+    return {
+      ...state,
+      neutralNotice: `${lockedChannel.frequencyMhz.toFixed(1)} MHz (${lockedChannel.label}) already logged.`,
+      neutralNoticeTimer: 2.2,
+    };
+  }
+
+  const entry: TunerSignalLog = {
+    id: `tuner-${state.tunerLogs.length + 1}-${Math.round(state.elapsedSec * 10)}`,
+    channelId: lockedChannel.id,
+    frequencyMhz: lockedChannel.frequencyMhz,
+    label: lockedChannel.label,
+    transcript: lockedChannel.transcript,
+    stopNumber: stop.number,
+    stopName: stop.name,
+    lineId: state.lineId,
+    timestampSec: state.elapsedSec,
+  };
+
+  return {
+    ...state,
+    tunerLogs: [entry, ...state.tunerLogs],
+    neutralNotice: `Signal locked: ${lockedChannel.frequencyMhz.toFixed(1)} MHz · ${lockedChannel.label}`,
+    neutralNoticeTimer: 2.8,
   };
 }
 
@@ -911,7 +1121,7 @@ export function addPolaroidPhoto(state: GameState, dataUrl: string): GameState {
     stopName: stop.name,
     dataUrl,
     timestampSec: state.elapsedSec,
-    caption: `Car B · Stop ${stop.number} (${stop.name})`,
+    caption: `Car B (${state.lineId}) · Stop ${stop.number} (${stop.name})`,
   };
   return {
     ...state,
@@ -924,7 +1134,12 @@ export function addPolaroidPhoto(state: GameState, dataUrl: string): GameState {
 /** Complete an EVP tape recording */
 export function finishEvpRecording(state: GameState): GameState {
   const stop = getCurrentStop(state);
-  const hasResonance = state.activeAnomalies.length > 0 || state.phase === 'blackout';
+  // Tape resonance is noise, not signal: derive it only from the clip's own
+  // identity (stop, timestamp, tape count), never from whether an anomaly is
+  // actually active — otherwise a recording would confirm one and give the
+  // answer away. Roughly a third of tapes sound resonant either way.
+  const tapeSeed = Math.round(state.elapsedSec * 10) + state.evpClips.length * 31 + stop.number * 7;
+  const hasResonance = tapeSeed % 3 === 0;
   const hints = [
     'Low rail hum... faint whisper counting backwards.',
     'Fluorescent ballast buzz... distant chime on an empty track.',
@@ -951,93 +1166,108 @@ export function finishEvpRecording(state: GameState): GameState {
 }
 
 /**
- * Evaluates the final Court Sq Travel Report and unlocks Nightmare mode / achievements.
- * TBD: Final ending variants and exact scoring thresholds are marked TBD per brief.
+ * Evaluates the final Travel Report using the 8 priority-ranked endings,
+ * persists run stats & discoveries to the Archive, and unlocks Nightmare mode.
  */
 export function finalizeRide(state: GameState): GameState {
   const trueFlags = state.flagLog.filter((f) => f._wasTrueAnomaly).length;
   const falsePositives = state.flagLog.filter((f) => !f._wasTrueAnomaly).length;
   const band = getSuspicionBand(state.suspicion.value);
-  const seq = getSequenceForDifficulty(state.difficulty);
+  const seq = getSequenceForDifficulty(state.difficulty, state.chapterId);
+  const line = getLineDefinition(state.lineId);
 
-  // TBD: Placeholder ending variants & scoring thresholds
-  let endingId = 'tbd_quiet_arrival';
-  let title = 'Quiet Arrival';
-  let subtitle = 'Ending A · Court Sq (Placeholder Thresholds — TBD)';
-  let summary =
-    'The doors open onto the real tile of Court Square. Mom stands first, Dad rests a hand on your shoulder, and neither of them asks what you counted.';
-
-  if (state.difficulty === 'practice') {
-    endingId = 'practice_complete';
-    title = 'Practice Run Complete';
-    subtitle = 'Training Segment Finished';
-    summary =
-      'You completed the shortened G train orientation loop. Ready for the full 13-stop ride from Hoyt-Schermerhorn to Court Sq.';
-  } else if (state.suspicion.value >= 75 || state.falseStopDisembarks > 0) {
-    endingId = 'tbd_kept_riding';
-    title = 'Past the Last Stop';
-    subtitle = 'Ending C · Hunted Variant (Placeholder Thresholds — TBD)';
-    summary =
-      'At Court Square the doors slide open, then close before you stand. Dad looks at the ceiling sign, smiles once, and says there is one more stop.';
-  } else if (
-    state.suspicion.value <= 24 &&
-    state.safeHavenChoice === 'taken' &&
-    state.restraintOutcome === 'held_still'
-  ) {
-    endingId = 'tbd_unseen_home';
-    title = 'Unseen All the Way Home';
-    subtitle = 'Ending S · Calm Variant (Placeholder Thresholds — TBD)';
-    summary =
-      'You noticed every wrong detail, kept your expression flat, sheltered at Myrtle-Willoughby, and never flinched at Greenpoint. The stairwell up to Jackson Ave smells like cold night air.';
-  } else if (state.suspicion.value >= 50 || state.restraintOutcome === 'let_go') {
-    endingId = 'tbd_watched_walk';
-    title = 'The Long Walk Up';
-    subtitle = 'Ending B · Watched Variant (Placeholder Thresholds — TBD)';
-    summary =
-      'You made it off the G at Court Square, though both parents stayed half a step behind you up the stairs, watching whether you turned around.';
-  }
+  const evaluated = evaluateEnding({
+    difficulty: state.difficulty,
+    lineId: state.lineId,
+    chapterId: state.chapterId,
+    finalSuspicion: state.suspicion.value,
+    finalSuspicionBand: band,
+    finalSanity: state.sanity.value,
+    finalSanityTier: state.sanity.tier,
+    trueFlags,
+    falsePositives,
+    safeHavenChoice: state.safeHavenChoice,
+    restraintOutcome: state.restraintOutcome,
+    falseStopDisembarks: state.falseStopDisembarks,
+    falseStopTrialsSurvived: state.falseStopTrialsSurvived,
+    falseStopTrialCollapsed: state.falseStopTrialCollapsed,
+    photosTaken: state.photos.length,
+    evpClipsRecorded: state.evpClips.length,
+    tunerSignalsLocked: state.tunerLogs.length,
+  });
 
   const achievements: string[] = [];
   if (state.difficulty !== 'practice') {
-    achievements.push('Last Local: Reached Court Sq');
-    if (state.suspicion.value <= 24) achievements.push('Poker Face: Finished in CALM');
-    if (state.safeHavenChoice === 'taken') achievements.push('Myrtle-Willoughby Shelter');
-    if (state.restraintOutcome === 'held_still') achievements.push('Still Hands at Greenpoint');
+    if (!state.falseStopTrialCollapsed) {
+      achievements.push(`Last Local (${line.id}): Reached ${line.terminusName}`);
+    }
+    if (state.suspicion.value <= 24 && !state.falseStopTrialCollapsed) {
+      achievements.push('Poker Face: Finished in CALM');
+    }
+    if (state.safeHavenChoice === 'taken') achievements.push(`${line.safeHavenName} Shelter`);
+    if (state.restraintOutcome === 'held_still') achievements.push('Still Hands Under Pressure');
+    if (state.falseStopTrialsSurvived >= 1) achievements.push('Back Before the Chime: Survived False Stop Trial');
     if (state.photos.length >= 1) achievements.push('Instant Evidence (Polaroid)');
     if (state.evpClips.length >= 1) achievements.push('Static Listener (EVP)');
-    if (state.difficulty === 'nightmare') achievements.push('Nightmare Express');
+    if (state.tunerLogs.length >= 1) achievements.push('Transit Frequency Intercepted');
+    if (state.difficulty === 'nightmare' && !state.falseStopTrialCollapsed) {
+      achievements.push('Nightmare Express');
+    }
   } else {
     achievements.push('First Token: Practice Complete');
   }
 
-  const wasUnlocked = isNightmareUnlocked();
-  const nightmareJustUnlocked = state.difficulty !== 'practice' && !wasUnlocked;
-  if (state.difficulty !== 'practice') {
-    saveNightmareUnlocked();
-  }
-  saveAchievements(achievements);
+  const prevArchive = loadArchive();
+  const wasUnlocked = prevArchive.nightmareUnlocked;
+  const updatedArchive = recordRunInArchive(prevArchive, {
+    lineId: state.lineId,
+    chapterId: state.chapterId,
+    difficulty: state.difficulty,
+    endingId: evaluated.endingId,
+    endingTitle: evaluated.title,
+    finalSuspicion: state.suspicion.value,
+    finalSanity: state.sanity.value,
+    trueFlags,
+    falsePositives,
+    durationSec: Math.round(state.elapsedSec),
+    highestStopReached: state.highestStopReached,
+    tunerChannelIds: state.tunerLogs.map((t) => t.channelId),
+    achievements,
+  });
+  saveArchive(updatedArchive);
+
+  const nightmareJustUnlocked = !wasUnlocked && updatedArchive.nightmareUnlocked;
 
   const report: EndingReportData = {
-    endingId,
-    title,
-    subtitle,
-    summary,
+    endingId: evaluated.endingId,
+    priority: evaluated.priority,
+    code: evaluated.code,
+    tone: evaluated.tone,
+    title: evaluated.title,
+    subtitle: evaluated.subtitle,
+    summary: evaluated.summary,
+    lineId: state.lineId,
+    chapterId: state.chapterId,
     difficulty: state.difficulty,
     finalSuspicion: state.suspicion.value,
     finalSuspicionBand: band,
     peakSuspicion: state.suspicion.peak,
     finalSanity: state.sanity.value,
     finalSanityTier: state.sanity.tier,
-    stopsCompleted: seq.length,
+    stopsCompleted: state.falseStopTrialCollapsed ? state.sequencePos + 1 : seq.length,
     totalStops: seq.length,
+    highestStopReached: state.highestStopReached,
     trueFlags,
     falsePositives,
     totalFlags: state.flagLog.length,
     safeHavenChoice: state.safeHavenChoice,
     restraintOutcome: state.restraintOutcome,
     falseStopDisembarks: state.falseStopDisembarks,
+    falseStopTrialsSurvived: state.falseStopTrialsSurvived,
+    falseStopTrialCollapsed: state.falseStopTrialCollapsed,
     photosTaken: state.photos.length,
     evpClipsRecorded: state.evpClips.length,
+    tunerSignalsLocked: state.tunerLogs.length,
     durationSec: Math.round(state.elapsedSec),
     unlockedAchievements: achievements,
     nightmareJustUnlocked,
@@ -1050,6 +1280,7 @@ export function finalizeRide(state: GameState): GameState {
     activePanel: 'none',
     maskPrompt: null,
     safeHavenPromptOpen: false,
+    activeTrial: null,
     endingReport: report,
   };
 }

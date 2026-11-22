@@ -1,15 +1,19 @@
 /**
- * Court Sq Ending Report Screen — Travel Report, Ending Variant (TBD thresholds marked),
- * Suspicion/Sanity/Flag/Haven/Restraint summary, Unlocked Achievements, and Nightmare unlock notice.
+ * Travel Report / Ending Screen — Priority-Ranked 8-Ending Evaluation,
+ * Suspicion/Sanity/Flag/Haven/Restraint/Trial/Tuner summary, Unlocked Achievements,
+ * Archive shortcut, and Nightmare unlock notice.
  */
 
 import React from 'react';
+import { getLineDefinition } from '../game/route';
 import { EndingReportData, RideDifficulty } from '../game/state';
 import { getSuspicionBandInfo } from '../game/suspicion';
 
 interface EndingReportProps {
   report: EndingReportData;
   nightmareUnlocked: boolean;
+  discoveredEndingsCount: number;
+  onOpenArchive: () => void;
   onPlayAgain: (difficulty: RideDifficulty) => void;
   onReturnTitle: () => void;
 }
@@ -17,12 +21,16 @@ interface EndingReportProps {
 export const EndingReport: React.FC<EndingReportProps> = ({
   report,
   nightmareUnlocked,
+  discoveredEndingsCount,
+  onOpenArchive,
   onPlayAgain,
   onReturnTitle,
 }) => {
   const bandInfo = getSuspicionBandInfo(report.finalSuspicion);
+  const line = getLineDefinition(report.lineId);
   const mins = Math.floor(report.durationSec / 60);
   const secs = String(report.durationSec % 60).padStart(2, '0');
+  const totalEvidence = report.photosTaken + report.evpClipsRecorded + report.tunerSignalsLocked;
 
   return (
     <div
@@ -40,11 +48,15 @@ export const EndingReport: React.FC<EndingReportProps> = ({
             <div className="flex items-center gap-2 text-xs text-[#9aa4a0] mb-1.5">
               <span
                 className="inline-flex items-center justify-center w-5 h-5 rounded-full text-[11px] font-bold text-white"
-                style={{ backgroundColor: '#6cbe45' }}
+                style={{ backgroundColor: line.color }}
               >
-                G
+                {line.id}
               </span>
-              <span>Court Sq · Travel Report</span>
+              <span className="font-mono-tabular text-[#d4dad7]">
+                {report.priority > 0 ? `P${report.priority} · ${report.code}` : report.code}
+              </span>
+              <span aria-hidden="true">·</span>
+              <span>{line.terminusName} Travel Report</span>
               <span aria-hidden="true">·</span>
               <span className="font-mono-tabular">
                 {mins}:{secs}
@@ -81,7 +93,7 @@ export const EndingReport: React.FC<EndingReportProps> = ({
         )}
 
         {/* Metrics Grid */}
-        <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-6">
+        <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-5">
           <div className="bg-[#0b0d0f] border border-white/10 rounded p-3">
             <div className="text-[11px] text-[#8e9894]">Suspicion</div>
             <div className="font-mono-tabular text-xl font-semibold mt-0.5">
@@ -100,7 +112,7 @@ export const EndingReport: React.FC<EndingReportProps> = ({
           </div>
 
           <div className="bg-[#0b0d0f] border border-white/10 rounded p-3">
-            <div className="text-[11px] text-[#8e9894]">Flags Logged</div>
+            <div className="text-[11px] text-[#8e9894]">Flags Verified</div>
             <div className="font-mono-tabular text-xl font-semibold mt-0.5">
               {report.trueFlags}
               <span className="text-xs text-[#7d8682] font-normal"> / {report.totalFlags}</span>
@@ -111,70 +123,92 @@ export const EndingReport: React.FC<EndingReportProps> = ({
           </div>
 
           <div className="bg-[#0b0d0f] border border-white/10 rounded p-3">
-            <div className="text-[11px] text-[#8e9894]">Evidence</div>
-            <div className="font-mono-tabular text-xl font-semibold mt-0.5">
-              {report.photosTaken + report.evpClipsRecorded}
-            </div>
+            <div className="text-[11px] text-[#8e9894]">Archive Evidence</div>
+            <div className="font-mono-tabular text-xl font-semibold mt-0.5">{totalEvidence}</div>
             <div className="text-[11px] text-[#858f8b] mt-0.5">
-              {report.photosTaken} photos · {report.evpClipsRecorded} EVP
+              {report.photosTaken}P · {report.evpClipsRecorded}E · {report.tunerSignalsLocked}R
             </div>
           </div>
         </div>
 
-        {/* Key Stop Decisions */}
-        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 mb-6 text-xs">
-          <div className="bg-[#0b0d0f] border border-white/10 rounded px-3.5 py-2.5 flex justify-between">
-            <span className="text-[#98a29e]">Stop 6 · Safe Haven</span>
-            <span className="font-medium text-[#eef0ee]">
+        {/* Key Stop & Trial Decisions */}
+        <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5 mb-6 text-xs">
+          <div className="bg-[#0b0d0f] border border-white/10 rounded px-3 py-2.5">
+            <div className="text-[#8e9894] text-[11px]">Stop 6 · Safe Haven</div>
+            <div className="font-medium text-[#eef0ee] mt-0.5">
               {report.safeHavenChoice === 'taken'
                 ? 'Took Shelter'
                 : report.safeHavenChoice === 'refused'
-                  ? 'Refused (+10 Suspicion)'
+                  ? 'Refused (+10)'
                   : 'Not Reached'}
-            </span>
+            </div>
           </div>
-          <div className="bg-[#0b0d0f] border border-white/10 rounded px-3.5 py-2.5 flex justify-between">
-            <span className="text-[#98a29e]">Stop 11 · Greenpoint Restraint</span>
-            <span className="font-medium text-[#eef0ee]">
+          <div className="bg-[#0b0d0f] border border-white/10 rounded px-3 py-2.5">
+            <div className="text-[#8e9894] text-[11px]">Stop 11 · Restraint</div>
+            <div className="font-medium text-[#eef0ee] mt-0.5">
               {report.restraintOutcome === 'held_still'
                 ? 'Held Still'
                 : report.restraintOutcome === 'let_go'
                   ? 'Let Go / Moved'
                   : 'Not Reached'}
-            </span>
+            </div>
+          </div>
+          <div className="bg-[#0b0d0f] border border-white/10 rounded px-3 py-2.5">
+            <div className="text-[#8e9894] text-[11px]">False Stop Trial</div>
+            <div className="font-medium text-[#eef0ee] mt-0.5">
+              {report.falseStopTrialCollapsed
+                ? 'Collapsed'
+                : report.falseStopTrialsSurvived > 0
+                  ? `Survived (${report.falseStopTrialsSurvived})`
+                  : 'Never Triggered'}
+            </div>
           </div>
         </div>
 
         {/* Unlocked Achievements */}
-        <div className="mb-6">
-          <div className="text-xs font-medium text-[#aeb7b3] mb-2">
-            Achievements Unlocked ({report.unlockedAchievements.length})
+        {report.unlockedAchievements.length > 0 && (
+          <div className="mb-6">
+            <div className="text-xs font-medium text-[#aeb7b3] mb-2">
+              Achievements Recorded ({report.unlockedAchievements.length})
+            </div>
+            <ul className="space-y-1.5 text-xs text-[#d6dcd9]">
+              {report.unlockedAchievements.map((ach) => (
+                <li
+                  key={ach}
+                  className="px-3 py-2 bg-[#0b0d0f] border border-white/8 rounded flex items-center justify-between"
+                >
+                  <span>{ach}</span>
+                  <span className="font-mono-tabular text-[11px] text-[#6cbe45]">SAVED</span>
+                </li>
+              ))}
+            </ul>
           </div>
-          <ul className="space-y-1.5 text-xs text-[#d6dcd9]">
-            {report.unlockedAchievements.map((ach) => (
-              <li
-                key={ach}
-                className="px-3 py-2 bg-[#0b0d0f] border border-white/8 rounded flex items-center justify-between"
-              >
-                <span>{ach}</span>
-                <span className="font-mono-tabular text-[11px] text-[#6cbe45]">RECORDED</span>
-              </li>
-            ))}
-          </ul>
-        </div>
+        )}
 
         {/* Actions */}
         <div className="flex flex-wrap items-center justify-between gap-3 pt-4 border-t border-white/10">
-          <button
-            type="button"
-            onClick={(e) => {
-              e.currentTarget.blur();
-              onReturnTitle();
-            }}
-            className="px-4 py-2 text-xs font-medium text-[#cfd6d3] hover:text-white border border-white/15 rounded transition-colors whitespace-nowrap"
-          >
-            Return to Title
-          </button>
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={(e) => {
+                e.currentTarget.blur();
+                onReturnTitle();
+              }}
+              className="px-4 py-2 text-xs font-medium text-[#cfd6d3] hover:text-white border border-white/15 rounded transition-colors whitespace-nowrap"
+            >
+              Return to Title
+            </button>
+            <button
+              type="button"
+              onClick={(e) => {
+                e.currentTarget.blur();
+                onOpenArchive();
+              }}
+              className="px-3.5 py-2 text-xs font-medium text-[#dce2df] bg-[#191e21] hover:bg-[#242b30] border border-white/15 rounded transition-colors whitespace-nowrap"
+            >
+              Archive ({discoveredEndingsCount}/8)
+            </button>
+          </div>
 
           <div className="flex items-center gap-2.5">
             {nightmareUnlocked && report.difficulty !== 'nightmare' && (

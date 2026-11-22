@@ -451,6 +451,23 @@ export class SubwayAudioEngine {
     }
   }
 
+  /** Subtle transit radio carrier pulse when tuning frequencies */
+  public playTunerPulse(signalStrength: number): void {
+    if (!this.ctx || !this.masterGain || this.paused) return;
+    const now = this.ctx.currentTime;
+    const osc = this.ctx.createOscillator();
+    const g = this.ctx.createGain();
+    osc.type = signalStrength > 0.72 ? 'sine' : 'sawtooth';
+    osc.frequency.setValueAtTime(signalStrength > 0.72 ? 640 : 180 + signalStrength * 260, now);
+    g.gain.setValueAtTime(0.001, now);
+    g.gain.exponentialRampToValueAtTime(0.045 * Math.max(0.25, signalStrength), now + 0.015);
+    g.gain.exponentialRampToValueAtTime(0.0005, now + 0.09);
+    osc.connect(g);
+    g.connect(this.masterGain);
+    osc.start(now);
+    osc.stop(now + 0.1);
+  }
+
   public dispose(): void {
     if (this.ctx) {
       void this.ctx.close().catch(() => {});
